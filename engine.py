@@ -418,7 +418,8 @@ class VRPSnapshot:
         if self.iv_rank.value is None:
             return f"IV Rank unavailable ({self.iv_rank.label})"
         if self.iv_rank.value < settings.min_iv_rank:
-            return f"IV Rank {self.iv_rank.value:.0f} < {settings.min_iv_rank:.0f}"
+            # One decimal: a 49.6 shown as "50 < 50" reads like a bug.
+            return f"IV Rank {self.iv_rank.value:.1f} < {settings.min_iv_rank:.0f}"
         if self.vrp is not None and self.vrp < settings.min_vrp:
             return f"VRP {self.vrp * 100:.1f}pts < {settings.min_vrp * 100:.1f}pts"
         return None

@@ -447,8 +447,10 @@ def render_scanner(bot: TradingBot) -> None:
                 "Spot": s.spot,
                 "Expiry": s.expiration.isoformat() if s.expiration else "—",
                 "DTE": s.dte,
-                "IV": s.implied_vol,
-                "RV": s.reference_rv,
+                # Vols are stored as decimals; column_config formats the raw
+                # value without scaling, so they are converted here.
+                "IV %": (s.implied_vol * 100) if s.implied_vol is not None else None,
+                "RV %": (s.reference_rv * 100) if s.reference_rv is not None else None,
                 "VRP (pts)": (s.vrp * 100) if s.vrp is not None else None,
                 "IV/RV": s.vrp_ratio,
                 "IV Rank": s.iv_rank.value,
@@ -464,11 +466,14 @@ def render_scanner(bot: TradingBot) -> None:
         hide_index=True,
         column_config={
             "Spot": st.column_config.NumberColumn(format="$%.2f"),
-            "IV": st.column_config.NumberColumn(format="%.1f%%", help="ATM implied volatility"),
-            "RV": st.column_config.NumberColumn(format="%.1f%%", help="Yang-Zhang realised volatility"),
-            "VRP (pts)": st.column_config.NumberColumn(format="%+.1f"),
+            "IV %": st.column_config.NumberColumn(format="%.1f", help="ATM implied volatility, annualised"),
+            "RV %": st.column_config.NumberColumn(format="%.1f", help="Yang-Zhang realised volatility, annualised"),
+            "VRP (pts)": st.column_config.NumberColumn(format="%+.1f", help="IV − RV in annualised vol points"),
             "IV/RV": st.column_config.NumberColumn(format="%.2f"),
-            "IV Rank": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f"),
+            # A plain number, not a progress bar: Streamlit renders ProgressColumn
+            # in its accent red, which would read as "bad" for a high IV Rank —
+            # exactly the value the strategy wants. Status carries the verdict.
+            "IV Rank": st.column_config.NumberColumn(format="%.0f", help="0–100 within the trailing IV range"),
         },
     )
 
