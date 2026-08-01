@@ -227,6 +227,10 @@ class ConsoleDeck:
             styles = {"good": S_GOOD, "warning": S_WARN, "critical": S_CRIT, "idle": S_IDLE}
             for position in positions:
                 verdict = self.bot.position_action(position)
+                # Anything that is not MONITOR wants a decision now, so it blinks.
+                action_style = styles[verdict["severity"]]
+                if verdict["severity"] != "idle":
+                    action_style += " blink"
                 captured = verdict["captured"]
                 ticker = f"{position.underlying or position.symbol} " + (
                     f"{position.option_type[0].upper()}{position.strike:g}" if position.option_type else ""
@@ -237,7 +241,7 @@ class ConsoleDeck:
                     f"${position.current_price:.2f}",
                     Text(f"{captured:+.0%}", style=S_GOOD if captured >= 0 else S_CRIT),
                     str(position.dte if position.dte is not None else "--"),
-                    Text(verdict["action"], style=styles[verdict["severity"]]),
+                    Text(verdict["action"], style=action_style),
                 )
 
         note = "brackets enforced by the bot, not resting at the exchange"

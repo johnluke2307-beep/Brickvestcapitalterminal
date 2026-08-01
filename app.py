@@ -206,6 +206,12 @@ def inject_terminal_css() -> None:
               letter-spacing: .06em; padding: .1rem .45rem; border-radius: 3px;
               border: 1px solid currentColor; white-space: nowrap;
           }}
+          /* Anything that is not MONITOR wants a decision now, so it blinks. */
+          @keyframes bvc-blink {{ 0%, 55% {{ opacity: 1; }} 56%, 100% {{ opacity: .28; }} }}
+          .bvc-tag.bvc-act {{ animation: bvc-blink 1.1s steps(1, end) infinite; }}
+          @media (prefers-reduced-motion: reduce) {{
+              .bvc-tag.bvc-act {{ animation: none; text-decoration: underline; }}
+          }}
           .t-good {{ color: {p["good"]}; }}
           .t-warn {{ color: {p["warning"]}; }}
           .t-crit {{ color: {p["critical"]}; }}
@@ -528,6 +534,8 @@ def render_risk_manager(bot: TradingBot, fx_quote) -> None:
         for position in positions:
             verdict = bot.position_action(position)
             cls = severity_class[verdict["severity"]]
+            if verdict["severity"] != "idle":
+                cls += " bvc-act"  # blinks — this one needs a decision
             captured = verdict["captured"]
             cap_cls = "t-good" if captured >= 0 else "t-crit"
             body += (
