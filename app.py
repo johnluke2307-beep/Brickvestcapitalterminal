@@ -316,14 +316,15 @@ def render_sidebar(bot: TradingBot) -> None:
                 bot.resume()
                 st.rerun()
         else:
+            no_keys = not settings.credentials_present
             columns = st.columns(2)
-            if columns[0].button("Start", use_container_width=True, disabled=bot.is_running):
+            if columns[0].button("Start", use_container_width=True, disabled=bot.is_running or no_keys):
                 bot.start()
                 st.rerun()
             if columns[1].button("Stop", use_container_width=True, disabled=not bot.is_running):
                 bot.stop()
                 st.rerun()
-            if st.button("Run one cycle now", use_container_width=True):
+            if st.button("Run one cycle now", use_container_width=True, disabled=no_keys):
                 with st.spinner("Running cycle…"):
                     result = bot.run_once()
                 st.toast(result.summary())
@@ -450,10 +451,14 @@ def render_deck_controls(bot: TradingBot) -> None:
     _, scanned_at, source = latest_scan(bot)
     halted = bot.state.is_halted
     running = bot.is_running
+    # Without credentials the first cycle would halt on an unreachable broker,
+    # leaving a fresh deployment with a halt to clear before anything happened.
+    no_keys = not bot.settings.credentials_present
+    blocked = halted or no_keys
 
     columns = st.columns([1.1, 1.1, 1.1, 4.7])
 
-    if columns[0].button("◆ RUN SCAN", use_container_width=True, disabled=halted, key="deck_scan"):
+    if columns[0].button("◆ RUN SCAN", use_container_width=True, disabled=blocked, key="deck_scan"):
         with st.spinner("Pricing chains…"):
             try:
                 st.session_state["scan"] = bot.scan()
@@ -466,11 +471,11 @@ def render_deck_controls(bot: TradingBot) -> None:
         if columns[1].button("■ STOP BOT", use_container_width=True, key="deck_stop"):
             bot.stop()
             st.rerun()
-    elif columns[1].button("▶ START BOT", use_container_width=True, disabled=halted, key="deck_start"):
+    elif columns[1].button("▶ START BOT", use_container_width=True, disabled=blocked, key="deck_start"):
         bot.start()
         st.rerun()
 
-    if columns[2].button("↻ RUN CYCLE", use_container_width=True, disabled=halted, key="deck_cycle"):
+    if columns[2].button("↻ RUN CYCLE", use_container_width=True, disabled=blocked, key="deck_cycle"):
         with st.spinner("Running cycle…"):
             result = bot.run_once()
         st.toast(result.summary())
@@ -478,6 +483,8 @@ def render_deck_controls(bot: TradingBot) -> None:
 
     if halted:
         note = f"HALTED — {bot.state.halt_reason}"
+    elif no_keys:
+        note = "NO CREDENTIALS — add ALPACA_API_KEY and ALPACA_SECRET_KEY, then reload (see Settings)"
     else:
         stamp = f"{scanned_at:%H:%M:%S} UTC ({source})" if scanned_at else "never"
         note = (
