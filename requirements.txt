@@ -8,3 +8,4 @@ streamlit>=1.37,<2.0        # dashboard runtime (st.fragment / column_config)
 alpaca-py>=0.42,<1.0        # trading, options chains and market data
 pandas>=2.0                 # tabular views only
 plotly>=5.20,<7.0           # charts
+rich>=13.0,<15.0            # console deck (terminal.py)

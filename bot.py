@@ -385,6 +385,42 @@ class TradingBot:
             settled.append({"symbol": record.get("symbol"), "reason": reason, "debit": debit, "pnl_usd": pnl_usd})
         return settled
 
+    def position_action(self, position: PositionView) -> dict:
+        """What the exit rules say about this position *right now*.
+
+        Deliberately routed through the same :meth:`_exit_decision` the trading
+        loop uses, so the action shown on screen is the action the bot will take
+        on its next cycle — a risk panel that disagrees with the engine is worse
+        than no risk panel.
+        """
+        record = self._live_record(position.symbol)
+        try:
+            credit = float(record["credit"]) if record and record.get("credit") else abs(position.avg_entry_price)
+        except (TypeError, ValueError):
+            credit = abs(position.avg_entry_price)
+
+        price = position.current_price
+        # Fraction of the credit already captured: 1.0 = the option is worthless.
+        captured = ((credit - price) / credit) if credit > 0 else 0.0
+        decision = self._exit_decision(position)
+
+        if decision is None:
+            return {
+                "action": "MONITOR", "severity": "idle", "captured": captured,
+                "credit": credit, "reason": "inside the bracket",
+            }
+
+        reason, trigger = decision
+        label, severity = {
+            "profit_target": ("CLOSE (PROFIT)", "good"),
+            "stop_loss": ("STOP OUT", "critical"),
+            "time_exit": ("CLOSE (21 DTE)", "warning"),
+        }[reason]
+        return {
+            "action": label, "severity": severity, "captured": captured,
+            "credit": credit, "reason": reason, "trigger": trigger,
+        }
+
     def _exit_decision(self, position: PositionView) -> Optional[tuple[str, float]]:
         """Return ``(reason, trigger_price)`` when an exit rule fires.
 

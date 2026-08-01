@@ -6,7 +6,7 @@ own beyond formatting, so the numbers on screen are the same numbers the
 execution loop trades on.
 
 Six tabs:
-    Overview   — capital, margin headroom, and Rand progress toward R10,000/month
+    Deck       — status strip, target acquisition, risk manager, operating rules
     Scanner    — the VRP edge, per symbol, with the reason anything was rejected
     Positions  — live short premium with its managed bracket levels
     Trade log  — realised record and the expectancy formula it produces
@@ -47,29 +47,19 @@ OPTION_MULTIPLIER = 100
 # volatility is always blue, realised volatility always orange — the colour follows
 # the entity, never its rank, so a filtered chart never repaints its survivors.
 THEMES = {
-    "light": {
-        "surface": "#fcfcfb",
-        "text": "#0b0b0b",
-        "muted": "#898781",
-        "grid": "#e1e0d9",
-        "axis": "#c3c2b7",
-        "series_1": "#2a78d6",  # blue  — implied vol / positive VRP / income
-        "series_2": "#eb6834",  # orange— realised vol
-        "series_1_fill": "rgba(42,120,214,0.12)",
-        "positive": "#2a78d6",
-        "negative": "#d03b3b",
-        "good": "#0ca30c",
-        "warning": "#fab219",
-        "critical": "#d03b3b",
-    },
+    # The deck runs dark by default; the light steps stay available for anyone
+    # who wants to read it in daylight. Both were validated against their own
+    # surface, so the series colours clear 3:1 and stay CVD-separable in each.
     "dark": {
-        "surface": "#1a1a19",
-        "text": "#ffffff",
-        "muted": "#898781",
-        "grid": "#2c2c2a",
-        "axis": "#383835",
-        "series_1": "#3987e5",
-        "series_2": "#d95926",
+        "surface": "#0b0e13",
+        "panel": "#11151c",
+        "border": "#1e2632",
+        "text": "#dfe6ee",
+        "muted": "#7d8896",
+        "grid": "#1a212b",
+        "axis": "#2a3340",
+        "series_1": "#3987e5",  # blue   — implied volatility, income, equity
+        "series_2": "#d95926",  # orange — realised volatility
         "series_1_fill": "rgba(57,135,229,0.16)",
         "positive": "#3987e5",
         "negative": "#d03b3b",
@@ -77,18 +67,161 @@ THEMES = {
         "warning": "#fab219",
         "critical": "#d03b3b",
     },
+    "light": {
+        "surface": "#fcfcfb",
+        "panel": "#f4f4f1",
+        "border": "#e1e0d9",
+        "text": "#0b0b0b",
+        "muted": "#898781",
+        "grid": "#e1e0d9",
+        "axis": "#c3c2b7",
+        "series_1": "#2a78d6",
+        "series_2": "#eb6834",
+        "series_1_fill": "rgba(42,120,214,0.12)",
+        "positive": "#2a78d6",
+        "negative": "#d03b3b",
+        "good": "#0ca30c",
+        "warning": "#fab219",
+        "critical": "#d03b3b",
+    },
 }
+
+MONO = "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace"
 
 
 def theme() -> dict:
-    """Chart palette matching the active Streamlit theme."""
+    """Chart palette matching the active deck theme."""
     base = st.session_state.get("chart_theme")
     if base not in THEMES:
         try:
-            base = st.get_option("theme.base") or "light"
+            base = st.get_option("theme.base") or "dark"
         except Exception:
-            base = "light"
-    return THEMES.get(base, THEMES["light"])
+            base = "dark"
+    return THEMES.get(base, THEMES["dark"])
+
+
+def inject_terminal_css() -> None:
+    """Terminal chrome: panel rules, monospace figures, status cells.
+
+    Streamlit\'s own theme (see .streamlit/config.toml) sets the base colours;
+    this adds the console furniture on top — hairline-bordered panels, uppercase
+    section rails, and tabular figures so columns of numbers line up.
+    """
+    p = theme()
+    st.markdown(
+        f"""
+        <style>
+          /* Streamlit reads .streamlit/config.toml relative to the working
+             directory, so a run started from elsewhere would keep the light
+             chrome. These rules make the deck dark regardless of how it was
+             launched. */
+          .stApp, [data-testid="stAppViewContainer"] {{ background: {p["surface"]}; }}
+          [data-testid="stHeader"] {{ background: transparent; }}
+          [data-testid="stSidebar"] {{
+              background: {p["panel"]};
+              border-right: 1px solid {p["border"]};
+          }}
+          [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2,
+          [data-testid="stSidebar"] h3, [data-testid="stSidebar"] p,
+          [data-testid="stSidebar"] label, [data-testid="stSidebar"] li {{
+              color: {p["text"]};
+          }}
+          [data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+          [data-testid="stSidebar"] small {{ color: {p["muted"]} !important; }}
+          /* Controls need their own colours — inheriting the text colour alone
+             leaves light-on-light buttons that cannot be read. */
+          .stButton > button, .stDownloadButton > button {{
+              background: {p["surface"]}; color: {p["text"]};
+              border: 1px solid {p["border"]}; font-family: {MONO};
+              font-size: .78rem; letter-spacing: .04em;
+          }}
+          .stButton > button:hover, .stDownloadButton > button:hover {{
+              border-color: {p["series_1"]}; color: {p["series_1"]};
+          }}
+          .stButton > button:disabled {{ color: {p["muted"]}; border-color: {p["border"]}; }}
+          [data-baseweb="select"] > div, [data-baseweb="input"] > div,
+          [data-testid="stSelectbox"] div[role="combobox"],
+          [data-testid="stNumberInput"] input,
+          [data-testid="stSelectbox"] div[data-baseweb="select"] div {{
+              background-color: {p["surface"]} !important;
+              border-color: {p["border"]} !important;
+              color: {p["text"]} !important;
+          }}
+          [data-baseweb="popover"] li {{
+              background-color: {p["panel"]} !important; color: {p["text"]} !important;
+          }}
+          [data-baseweb="select"] svg {{ fill: {p["muted"]}; }}
+          /* Figures in tables, metrics and code align only with tabular numerals. */
+          [data-testid="stMetricValue"], [data-testid="stDataFrame"], .bvc-mono {{
+              font-family: {MONO};
+              font-variant-numeric: tabular-nums;
+          }}
+          [data-testid="stMetricValue"] {{ font-size: 1.45rem; }}
+          [data-testid="stMetricLabel"] p {{
+              text-transform: uppercase; letter-spacing: .08em;
+              font-size: .68rem; color: {p["muted"]};
+          }}
+          .bvc-panel {{
+              border: 1px solid {p["border"]}; border-radius: 6px;
+              background: {p["panel"]}; padding: .55rem .8rem .7rem;
+              margin-bottom: .6rem;
+          }}
+          .bvc-panel-title {{
+              font-family: {MONO}; font-size: .7rem; font-weight: 700;
+              text-transform: uppercase; letter-spacing: .14em;
+              color: {p["muted"]}; border-bottom: 1px solid {p["border"]};
+              padding-bottom: .35rem; margin-bottom: .5rem;
+          }}
+          .bvc-strip {{
+              display: flex; flex-wrap: wrap; gap: 0;
+              border: 1px solid {p["border"]}; border-radius: 6px;
+              background: {p["panel"]}; overflow: hidden; margin-bottom: .75rem;
+          }}
+          .bvc-cell {{
+              flex: 1 1 118px; padding: .5rem .8rem;
+              border-right: 1px solid {p["border"]};
+          }}
+          .bvc-cell:last-child {{ border-right: none; }}
+          .bvc-cell .k {{
+              font-family: {MONO}; font-size: .62rem; letter-spacing: .12em;
+              text-transform: uppercase; color: {p["muted"]};
+          }}
+          .bvc-cell .v {{
+              font-family: {MONO}; font-size: 1.05rem; font-weight: 700;
+              color: {p["text"]}; font-variant-numeric: tabular-nums;
+          }}
+          .bvc-row {{
+              display: grid; align-items: center; gap: .5rem;
+              font-family: {MONO}; font-size: .78rem;
+              padding: .3rem 0; border-bottom: 1px solid {p["border"]};
+              font-variant-numeric: tabular-nums;
+          }}
+          .bvc-row:last-child {{ border-bottom: none; }}
+          .bvc-head {{
+              color: {p["muted"]}; font-size: .64rem; letter-spacing: .1em;
+              text-transform: uppercase; border-bottom: 1px solid {p["border"]};
+          }}
+          .bvc-tag {{
+              font-family: {MONO}; font-size: .68rem; font-weight: 700;
+              letter-spacing: .06em; padding: .1rem .45rem; border-radius: 3px;
+              border: 1px solid currentColor; white-space: nowrap;
+          }}
+          .t-good {{ color: {p["good"]}; }}
+          .t-warn {{ color: {p["warning"]}; }}
+          .t-crit {{ color: {p["critical"]}; }}
+          .t-idle {{ color: {p["muted"]}; }}
+          .t-accent {{ color: {p["series_1"]}; }}
+          .bvc-footer {{
+              font-family: {MONO}; font-size: .7rem; color: {p["muted"]};
+              border-top: 1px solid {p["border"]}; padding-top: .5rem;
+              margin-top: .4rem; letter-spacing: .04em;
+          }}
+          /* A live risk figure must never blink — motion on a number you are
+             about to act on costs legibility exactly when it matters most. */
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def style_figure(fig: go.Figure, height: int = 320, *, showlegend: bool = False) -> go.Figure:
@@ -214,24 +347,32 @@ def render_sidebar(bot: TradingBot) -> None:
                 st.rerun()
 
         st.divider()
+        # Chart colours only — the deck chrome follows .streamlit/config.toml.
         st.session_state["chart_theme"] = st.selectbox(
-            "Chart theme", ["light", "dark"], index=0 if theme() is THEMES["light"] else 1
+            "Chart palette", ["dark", "light"], index=0 if theme() is THEMES["dark"] else 1
         )
 
 
 # ======================================================================================
-# Tab 1 — Overview
+# Tab 1 — Deck
 # ======================================================================================
-def render_overview(bot: TradingBot) -> None:
+def render_deck(bot: TradingBot) -> None:
+    """The command deck: status strip, target acquisition, risk manager, logic rail.
+
+    Layout mirrors a console terminal — a scan panel on the left, live risk on
+    the right at twice the width, and the operating rules pinned along the
+    bottom so the parameters the bot is enforcing are never off-screen.
+    """
     settings = bot.settings
+    palette = theme()
     fx_quote = bot.fx.get_rate()
 
+    account = None
+    account_error = None
     try:
         account = bot.client.get_account()
     except BrokerError as exc:
-        st.error(f"Could not read the account: {exc}")
-        st.info("The bot halts rather than trading on stale data. Fix the connection, then resume from the sidebar.")
-        account = None
+        account_error = str(exc)
 
     closed = bot.trade_log.closed_trades()
     expectancy = engine.compute_expectancy(closed)
@@ -240,99 +381,201 @@ def render_overview(bot: TradingBot) -> None:
     month_zar = zar_by_month.get(month_key, 0.0)
     progress = month_zar / settings.monthly_target_zar if settings.monthly_target_zar else 0.0
 
-    # ---- headline tiles ---------------------------------------------------
-    columns = st.columns(4)
-    if account:
-        columns[0].metric(
-            "Account equity",
-            fmt_usd(account.equity),
-            delta=f"{account.day_pnl:+,.2f} today" if account.last_equity else None,
-        )
-        columns[1].metric("Equity in Rand", fmt_zar(account.equity * fx_quote.rate))
-    else:
-        columns[0].metric("Account equity", "—")
-        columns[1].metric("Equity in Rand", "—")
+    render_status_strip(bot, account, fx_quote, month_zar, progress, expectancy)
 
-    columns[2].metric(
-        f"{datetime.now(timezone.utc).strftime('%B')} realised",
-        fmt_zar(month_zar),
-        delta=f"{progress:.0%} of target",
-    )
-    columns[3].metric(
-        "Expectancy / trade",
-        fmt_usd(expectancy.expectancy) if expectancy.has_data else "—",
-        help="E = (P_win × W) − (P_loss × L) over closed trades",
-    )
+    if account_error:
+        st.error(f"ACCOUNT FEED DOWN — {account_error}")
+        st.caption("The bot halts rather than trade on stale data. Fix the link, then resume from the sidebar.")
 
-    # ---- the R10,000 baseline --------------------------------------------
-    st.markdown(f"**Monthly target — {fmt_zar(settings.monthly_target_zar)}**")
-    st.progress(min(max(progress, 0.0), 1.0))
-    remaining = max(settings.monthly_target_zar - month_zar, 0.0)
-    st.caption(
-        f"{fmt_zar(month_zar)} banked · {fmt_zar(remaining)} to go · "
-        f"≈ {fmt_usd(remaining / fx_quote.rate if fx_quote.rate else 0)} of net premium at {fx_quote.rate:.2f}"
-    )
-
-    # ---- margin guardrail -------------------------------------------------
-    st.divider()
-    left, right = st.columns([1, 1])
-
+    left, right = st.columns([1, 2], gap="small")
     with left:
-        st.markdown("**Margin guardrail**")
-        if account:
-            utilisation = account.margin_utilization
-            ceiling = settings.max_margin_utilization
-            palette = theme()
-            over = utilisation > ceiling
-            st.progress(min(utilisation / max(ceiling, 1e-9), 1.0))
-            st.markdown(
-                f"<span style='color:{palette['critical'] if over else palette['good']};font-weight:600'>"
-                f"{'⛔ BREACHED' if over else '✅ Within limit'}</span> — "
-                f"maintenance margin {fmt_usd(account.maintenance_margin)} of {fmt_usd(account.equity)} equity "
-                f"({utilisation:.1%} of a {ceiling:.0%} ceiling)",
-                unsafe_allow_html=True,
-            )
-            st.caption(
-                f"Options buying power {fmt_usd(account.options_buying_power)} · "
-                f"Cash {fmt_usd(account.cash)} · "
-                f"Options level {account.options_trading_level if account.options_trading_level is not None else '—'}"
-            )
-        else:
-            st.caption("Account unavailable.")
-
+        render_target_acquisition(bot)
     with right:
-        st.markdown("**Realised expectancy**")
-        hurdle = engine.breakeven_win_rate()
-        if expectancy.has_data:
-            grid = st.columns(3)
-            grid[0].metric(
-                "Win rate",
-                fmt_pct(expectancy.p_win, 0),
-                delta=f"{(expectancy.p_win - hurdle) * 100:+.0f}pts vs breakeven",
-            )
-            grid[1].metric("Avg win", fmt_usd(expectancy.avg_win))
-            grid[2].metric("Avg loss", fmt_usd(-expectancy.avg_loss))
-            st.caption(
-                f"E = ({expectancy.p_win:.2f} × {expectancy.avg_win:,.2f}) − "
-                f"({expectancy.p_loss:.2f} × {expectancy.avg_loss:,.2f}) = "
-                f"**{expectancy.expectancy:,.2f} USD** over {expectancy.trades} closed trades"
-            )
-        else:
-            st.caption("No closed trades yet — expectancy appears after the first position is settled.")
-        st.caption(
-            f"The 50% target / 200% stop geometry breaks even at a **{hurdle:.0%}** win rate. "
-            "Bracket placement alone cannot beat that — only selling volatility richer than what realises can."
-        )
+        render_risk_manager(bot, fx_quote)
 
-    # ---- charts -----------------------------------------------------------
-    st.divider()
-    chart_left, chart_right = st.columns(2)
-    with chart_left:
-        st.markdown("**Realised income by month (ZAR)**")
+    stop_pct = settings.stop_loss_multiple * 100
+    st.markdown(
+        f'<div class="bvc-footer">LOGIC: {settings.profit_target_pct:.0%} PROFIT TAKER ACTIVE'
+        f" &nbsp;|&nbsp; STOP LOSS: {stop_pct:.0f}% OF CREDIT ({settings.stop_loss_price_multiple:.0f}x BUYBACK)"
+        f" &nbsp;|&nbsp; TIME EXIT: {settings.time_exit_dte} DTE"
+        f" &nbsp;|&nbsp; MAX MARGIN: {settings.max_margin_utilization:.0%} NAV"
+        f" &nbsp;|&nbsp; ENTRY: {settings.target_dte} DTE @ {settings.target_delta:.2f}Δ, IVR ≥ {settings.min_iv_rank:.0f}"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ---- analytics below the fold ----------------------------------------
+    st.write("")
+    left, right = st.columns(2)
+    with left:
+        st.markdown('<div class="bvc-panel-title">Realised income by month (ZAR)</div>', unsafe_allow_html=True)
         render_monthly_income_chart(zar_by_month, settings.monthly_target_zar)
-    with chart_right:
-        st.markdown("**Cumulative realised P&L (ZAR)**")
+    with right:
+        st.markdown('<div class="bvc-panel-title">Cumulative realised P&L (ZAR)</div>', unsafe_allow_html=True)
         render_cumulative_pnl_chart(closed)
+
+    render_expectancy_panel(expectancy, account, settings, palette)
+
+
+def render_status_strip(bot, account, fx_quote, month_zar, progress, expectancy) -> None:
+    """One row of console cells: link, capital, margin headroom, target progress."""
+    settings = bot.settings
+    palette = theme()
+    health = bot.client.health
+
+    link_class, link_text = {
+        "ok": ("t-good", "ONLINE"),
+        "degraded": ("t-warn", "DEGRADED"),
+        "down": ("t-crit", "OFFLINE"),
+    }[health.status]
+    if bot.state.is_halted:
+        link_class, link_text = "t-crit", "HALTED"
+
+    if account:
+        util = account.margin_utilization
+        util_class = "t-crit" if util > settings.max_margin_utilization else "t-good"
+        cells = [
+            ("LINK", f'<span class="{link_class}">{link_text}</span> · {"PAPER" if settings.paper else "LIVE"}'),
+            ("NAV USD", f"${account.equity:,.0f}"),
+            ("NAV ZAR", f"R{account.equity * fx_quote.rate:,.0f}"),
+            ("DAY P&L", _signed(account.day_pnl, palette, "$")),
+            ("MARGIN", f'<span class="{util_class}">{util:.0%}</span> / {settings.max_margin_utilization:.0%}'),
+            (f"{datetime.now(timezone.utc):%b} ZAR", f"R{month_zar:,.0f}"),
+            ("TARGET", f'<span class="t-accent">{progress:.0%}</span> of R{settings.monthly_target_zar:,.0f}'),
+            ("EXPECTANCY", _signed(expectancy.expectancy, palette, "$") if expectancy.has_data else "—"),
+        ]
+    else:
+        cells = [
+            ("LINK", f'<span class="{link_class}">{link_text}</span>'),
+            ("NAV USD", "—"), ("NAV ZAR", "—"), ("DAY P&L", "—"), ("MARGIN", "—"),
+            (f"{datetime.now(timezone.utc):%b} ZAR", f"R{month_zar:,.0f}"),
+            ("TARGET", f"{progress:.0%}"),
+            ("EXPECTANCY", _signed(expectancy.expectancy, palette, "$") if expectancy.has_data else "—"),
+        ]
+
+    html = "".join(f'<div class="bvc-cell"><div class="k">{k}</div><div class="v">{v}</div></div>' for k, v in cells)
+    st.markdown(f'<div class="bvc-strip">{html}</div>', unsafe_allow_html=True)
+
+
+def _signed(value: float, palette: dict, prefix: str = "") -> str:
+    colour = palette["good"] if value >= 0 else palette["critical"]
+    return f'<span style="color:{colour}">{prefix}{value:+,.2f}</span>'
+
+
+def render_target_acquisition(bot: TradingBot) -> None:
+    """Left panel — the VRP scan, ranked, with each symbol's verdict."""
+    snapshots: List[engine.VRPSnapshot] = st.session_state.get("scan", [])
+    rows = ""
+    if snapshots:
+        ranked = sorted(
+            snapshots, key=lambda s: (s.is_tradeable, s.vrp if s.vrp is not None else -9), reverse=True
+        )
+        for rank, snap in enumerate(ranked[:10], start=1):
+            if snap.is_tradeable:
+                tag, cls = "SELL", "t-good"
+            else:
+                tag, cls = "PASS", "t-idle"
+            vrp = f"{snap.vrp * 100:+.1f}" if snap.vrp is not None else "  n/a"
+            ivr = f"{snap.iv_rank.value:.0f}" if snap.iv_rank.value is not None else "--"
+            rows += (
+                '<div class="bvc-row" style="grid-template-columns:1.2rem 3.2rem 3rem 2.4rem 3rem;">'
+                f'<span class="t-idle">{rank}</span>'
+                f'<span class="t-accent">{snap.symbol}</span>'
+                f"<span>{vrp}</span><span>{ivr}</span>"
+                f'<span class="{cls}">{tag}</span></div>'
+            )
+    else:
+        rows = '<div class="bvc-row t-idle">no scan yet — run one from the Scanner tab</div>'
+
+    header = (
+        '<div class="bvc-row bvc-head" style="grid-template-columns:1.2rem 3.2rem 3rem 2.4rem 3rem;">'
+        "<span>#</span><span>TKR</span><span>VRP</span><span>IVR</span><span>SIG</span></div>"
+    )
+    st.markdown(
+        f'<div class="bvc-panel"><div class="bvc-panel-title">◆ Target acquisition · IV−RV</div>{header}{rows}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_risk_manager(bot: TradingBot, fx_quote) -> None:
+    """Right panel — open short premium and the action the bot will take next.
+
+    The action column is computed by ``bot.position_action``, the same rules the
+    execution loop runs, so this panel cannot drift away from what will happen.
+    """
+    try:
+        positions = [p for p in bot.client.get_option_positions() if p.is_short]
+    except BrokerError as exc:
+        st.markdown(
+            f'<div class="bvc-panel"><div class="bvc-panel-title">▣ Risk manager</div>'
+            f'<div class="bvc-row t-crit">position feed down — {exc}</div></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    grid = "grid-template-columns:4.2rem 3.4rem 3.4rem 3.2rem 2.4rem 8rem;"
+    header = (
+        f'<div class="bvc-row bvc-head" style="{grid}">'
+        "<span>TICKER</span><span>CREDIT</span><span>MARK</span><span>CAPT</span><span>DTE</span>"
+        "<span style='text-align:right'>ACTION</span></div>"
+    )
+
+    if not positions:
+        body = '<div class="bvc-row t-idle">flat — no open short premium</div>'
+    else:
+        body = ""
+        severity_class = {"good": "t-good", "warning": "t-warn", "critical": "t-crit", "idle": "t-idle"}
+        for position in positions:
+            verdict = bot.position_action(position)
+            cls = severity_class[verdict["severity"]]
+            captured = verdict["captured"]
+            cap_cls = "t-good" if captured >= 0 else "t-crit"
+            body += (
+                f'<div class="bvc-row" style="{grid}">'
+                f'<span class="t-accent">{position.underlying or position.symbol}'
+                f'<span class="t-idle"> {position.option_type[0].upper() if position.option_type else ""}'
+                f'{position.strike:g}</span></span>'
+                f'<span>${verdict["credit"]:.2f}</span>'
+                f'<span>${position.current_price:.2f}</span>'
+                f'<span class="{cap_cls}">{captured:+.0%}</span>'
+                f'<span>{position.dte if position.dte is not None else "--"}</span>'
+                f'<span style="text-align:right"><span class="bvc-tag {cls}">{verdict["action"]}</span></span>'
+                "</div>"
+            )
+
+    st.markdown(
+        f'<div class="bvc-panel"><div class="bvc-panel-title">▣ Risk manager · managed brackets</div>'
+        f"{header}{body}</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Brackets are enforced by the bot each cycle, not resting at the exchange — "
+        "Alpaca does not accept bracket orders on option legs. A stopped bot means unmanaged positions."
+    )
+
+
+def render_expectancy_panel(expectancy, account, settings, palette) -> None:
+    """The expectancy formula, spelled out, with the bracket's breakeven hurdle."""
+    hurdle = engine.breakeven_win_rate()
+    st.markdown('<div class="bvc-panel-title">Σ Expectancy</div>', unsafe_allow_html=True)
+    if expectancy.has_data:
+        grid = st.columns(4)
+        grid[0].metric("Win rate", fmt_pct(expectancy.p_win, 0), delta=f"{(expectancy.p_win - hurdle) * 100:+.0f}pts vs breakeven")
+        grid[1].metric("Avg win", fmt_usd(expectancy.avg_win))
+        grid[2].metric("Avg loss", fmt_usd(-expectancy.avg_loss))
+        grid[3].metric("Profit factor", f"{expectancy.profit_factor:.2f}" if expectancy.profit_factor else "—")
+        st.markdown(
+            f'<div class="bvc-mono">E = ({expectancy.p_win:.3f} × {expectancy.avg_win:,.2f}) − '
+            f"({expectancy.p_loss:.3f} × {expectancy.avg_loss:,.2f}) = "
+            f"<b>{expectancy.expectancy:,.2f} USD</b> per trade over {expectancy.trades} closed</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("No closed trades yet — expectancy appears once the first position settles.")
+    st.caption(
+        f"The {settings.profit_target_pct:.0%} target / {settings.stop_loss_multiple:.0%} stop geometry breaks even at a "
+        f"{hurdle:.0%} win rate. Bracket placement alone cannot beat that — only selling volatility richer than what realises can."
+    )
 
 
 def render_monthly_income_chart(zar_by_month: dict, target: float) -> None:
@@ -418,6 +661,9 @@ def render_scanner(bot: TradingBot) -> None:
             try:
                 st.session_state["scan"] = bot.scan()
                 st.session_state["scan_at"] = datetime.now(timezone.utc)
+                # The Deck tab is rendered earlier in this same pass, so it still
+                # holds the previous result — rerun so both tabs agree.
+                st.rerun()
             except BrokerError as exc:
                 st.error(f"Scan failed: {exc}")
 
@@ -825,23 +1071,49 @@ def render_settings(bot: TradingBot) -> None:
 # ======================================================================================
 def main() -> None:
     bot = get_bot()
+    inject_terminal_css()
     render_sidebar(bot)
 
-    st.title("Brickvestcapitalterminal")
-    st.caption(
-        "Mechanical variance-risk-premium harvesting · 45 DTE · 30 delta · IV Rank > 50 · "
-        "50% profit target / 200% stop · Alpaca"
+    palette = theme()
+    health = bot.client.health
+    if bot.state.is_halted:
+        banner, colour = "HALTED", palette["critical"]
+    else:
+        banner, colour = (
+            {"ok": ("ONLINE", palette["good"]),
+             "degraded": ("DEGRADED", palette["warning"]),
+             "down": ("OFFLINE", palette["critical"])}[health.status]
+        )
+
+    st.markdown(
+        f"""
+        <div style="font-family:{MONO};border:1px solid {palette['border']};border-radius:6px;
+                    background:{palette['panel']};padding:.55rem .9rem;margin-bottom:.75rem;
+                    display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;">
+          <span style="font-weight:700;letter-spacing:.22em;font-size:.95rem;color:{palette['text']};">
+            BRICKVEST CAPITAL TERMINAL
+          </span>
+          <span style="font-size:.7rem;letter-spacing:.1em;color:{palette['muted']};">
+            VARIANCE RISK PREMIUM · {bot.settings.target_dte} DTE · {bot.settings.target_delta:.2f}Δ ·
+            IVR &gt; {bot.settings.min_iv_rank:.0f} · ALPACA {'PAPER' if bot.settings.paper else 'LIVE'}
+          </span>
+          <span style="font-size:.8rem;font-weight:700;letter-spacing:.12em;color:{colour};">
+            STATUS: {banner}
+          </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
     if bot.state.is_halted:
-        st.error(f"🔴 **EMERGENCY HALT** — {bot.state.halt_reason}. Positions are not being managed.")
+        st.error(f"EMERGENCY HALT — {bot.state.halt_reason}. Positions are not being managed.")
 
     if not bot.settings.paper:
         st.warning("⚠️ Live trading mode is enabled. Orders will be sent to a funded account.")
 
-    tabs = st.tabs(["Overview", "Scanner", "Positions", "Trade log", "Bot", "Settings"])
+    tabs = st.tabs(["Deck", "Scanner", "Positions", "Trade log", "Bot", "Settings"])
     with tabs[0]:
-        render_overview(bot)
+        render_deck(bot)
     with tabs[1]:
         render_scanner(bot)
     with tabs[2]:

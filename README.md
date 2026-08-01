@@ -43,11 +43,13 @@ trade, computed from the short strike's delta and the managed exits.
 | File | Responsibility |
 |---|---|
 | `app.py` | Streamlit dashboard — six tabs, no business logic of its own |
+| `terminal.py` | The same deck in a console, via Rich — for an always-on host |
 | `broker_client.py` | Alpaca connection, account, positions, option chains, order routing, connection health |
 | `engine.py` | Black-Scholes, realised-volatility estimators, VRP, IV Rank, expectancy, USD→ZAR |
 | `bot.py` | The execution loop: preflight → manage → scan → enter |
 | `config.py` | Every tunable, resolved from env vars → `st.secrets` → defaults |
-| `requirements.txt` | Four dependencies, all free-tier friendly |
+| `.streamlit/config.toml` | Terminal chrome — dark deck, monospace figures |
+| `requirements.txt` | Five dependencies, all free-tier friendly |
 | `tests/test_engine.py` | Maths regression tests (no network, no credentials) |
 
 `engine.py` has **no broker dependency** — give it prices, it gives you an edge
@@ -102,7 +104,7 @@ appears. It is never presented as something it is not.
 
 | Guardrail | Default | Where it is enforced |
 |---|---|---|
-| Maintenance margin ceiling | 50% of equity | `bot._entry_blockers` and `bot._buying_power_ok` — the latter checks *projected* post-trade utilisation, so the limit is forward-looking |
+| Maintenance margin ceiling | 50% of equity | `bot._entry_blockers` and `bot._capital_reject_reason` — the latter checks *projected* post-trade utilisation, so the limit is forward-looking |
 | Equity floor | $2,000 | no entries below it |
 | Max open positions | 6 | counted from live broker positions, not the log |
 | Max new entries per day | 2 | throttles correlated same-day risk |
@@ -111,6 +113,11 @@ appears. It is never presented as something it is not.
 | Stop loss | 200% of credit | i.e. buy back at 3× credit; sent as a marketable close so it actually gets out |
 | Time exit | 21 DTE | gamma risk rises faster than remaining theta |
 | Fail-safe | any broker or data failure | halts the bot, persists the reason, flags the UI red; only a human clears it |
+
+Both front ends compute the ACTION column through `TradingBot.position_action`,
+which routes to the same `_exit_decision` the trading loop uses. A risk panel
+that can disagree with the engine is worse than no risk panel, so they cannot
+drift apart.
 
 The fail-safe is the important one. `BrokerClient._guard` is the single choke
 point for every outbound call: it retries transient failures with backoff, records
@@ -143,7 +150,22 @@ export ALPACA_PAPER=true
 streamlit run app.py
 ```
 
-Head-less execution without the UI:
+Two front ends over one engine:
+
+```bash
+streamlit run app.py         # browser deck
+python terminal.py           # console deck (Rich), monitor only
+python terminal.py --live    # console deck that also runs the trading loop
+```
+
+The console deck exists because Streamlit Community Cloud sleeps on inactivity,
+and a sleeping app is a stopped bot, which is unmanaged positions. On a VPS or a
+Pi, run `terminal.py --live` (or `bot.py --loop`) and keep the browser dashboard
+for analysis. Run `streamlit run app.py` from the repository root so
+`.streamlit/config.toml` is picked up — Streamlit resolves it against the working
+directory, and without it the deck falls back to light chrome.
+
+Head-less execution without any UI:
 
 ```bash
 python bot.py --dry-run          # one cycle, scores everything, sends nothing
