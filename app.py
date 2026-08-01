@@ -388,6 +388,7 @@ def render_deck(bot: TradingBot) -> None:
     progress = month_zar / settings.monthly_target_zar if settings.monthly_target_zar else 0.0
 
     render_status_strip(bot, account, fx_quote, month_zar, progress, expectancy)
+    render_deck_controls(bot)
 
     if account_error:
         st.error(f"ACCOUNT FEED DOWN — {account_error}")
@@ -421,6 +422,70 @@ def render_deck(bot: TradingBot) -> None:
         render_cumulative_pnl_chart(closed)
 
     render_expectancy_panel(expectancy, account, settings, palette)
+
+
+def latest_scan(bot: TradingBot) -> tuple[List[engine.VRPSnapshot], Optional[datetime], str]:
+    """The freshest scan available, from either the operator or the bot.
+
+    A running bot scans every cycle, so the deck prefers that result whenever it
+    is newer than the last manual scan — the panel stays live without anyone
+    pressing anything.
+    """
+    manual = st.session_state.get("scan", [])
+    manual_at = st.session_state.get("scan_at")
+
+    auto, auto_at = [], None
+    if bot.last_result and bot.last_result.scanned:
+        auto, auto_at = bot.last_result.scanned, bot.last_result.started_at
+
+    if auto and (manual_at is None or (auto_at and auto_at > manual_at)):
+        return auto, auto_at, "bot cycle"
+    if manual:
+        return manual, manual_at, "manual scan"
+    return [], None, "none"
+
+
+def render_deck_controls(bot: TradingBot) -> None:
+    """Scan and automation controls, so the deck needs no other tab to drive it."""
+    _, scanned_at, source = latest_scan(bot)
+    halted = bot.state.is_halted
+    running = bot.is_running
+
+    columns = st.columns([1.1, 1.1, 1.1, 4.7])
+
+    if columns[0].button("◆ RUN SCAN", use_container_width=True, disabled=halted, key="deck_scan"):
+        with st.spinner("Pricing chains…"):
+            try:
+                st.session_state["scan"] = bot.scan()
+                st.session_state["scan_at"] = datetime.now(timezone.utc)
+                st.rerun()
+            except BrokerError as exc:
+                st.error(f"SCAN FAILED — {exc}")
+
+    if running:
+        if columns[1].button("■ STOP BOT", use_container_width=True, key="deck_stop"):
+            bot.stop()
+            st.rerun()
+    elif columns[1].button("▶ START BOT", use_container_width=True, disabled=halted, key="deck_start"):
+        bot.start()
+        st.rerun()
+
+    if columns[2].button("↻ RUN CYCLE", use_container_width=True, disabled=halted, key="deck_cycle"):
+        with st.spinner("Running cycle…"):
+            result = bot.run_once()
+        st.toast(result.summary())
+        st.rerun()
+
+    if halted:
+        note = f"HALTED — {bot.state.halt_reason}"
+    else:
+        stamp = f"{scanned_at:%H:%M:%S} UTC ({source})" if scanned_at else "never"
+        note = (
+            f"BOT {'RUNNING' if running else 'IDLE'} · {bot.state.cycles} cycles · "
+            f"{bot.state.entries_today_count()} entries today · last scan {stamp}"
+        )
+    columns[3].markdown(f'<div class="bvc-footer" style="border:none;padding-top:.55rem">{note}</div>',
+                        unsafe_allow_html=True)
 
 
 def render_status_strip(bot, account, fx_quote, month_zar, progress, expectancy) -> None:
@@ -470,7 +535,7 @@ def _signed(value: float, palette: dict, prefix: str = "") -> str:
 
 def render_target_acquisition(bot: TradingBot) -> None:
     """Left panel — the VRP scan, ranked, with each symbol's verdict."""
-    snapshots: List[engine.VRPSnapshot] = st.session_state.get("scan", [])
+    snapshots, scanned_at, _ = latest_scan(bot)
     rows = ""
     if snapshots:
         ranked = sorted(
@@ -491,14 +556,16 @@ def render_target_acquisition(bot: TradingBot) -> None:
                 f'<span class="{cls}">{tag}</span></div>'
             )
     else:
-        rows = '<div class="bvc-row t-idle">no scan yet — run one from the Scanner tab</div>'
+        rows = '<div class="bvc-row t-idle">no scan yet — press RUN SCAN</div>'
 
     header = (
         '<div class="bvc-row bvc-head" style="grid-template-columns:1.2rem 3.2rem 3rem 2.4rem 3rem;">'
         "<span>#</span><span>TKR</span><span>VRP</span><span>IVR</span><span>SIG</span></div>"
     )
+    stamp = f"{scanned_at:%H:%M:%S}" if scanned_at else "--:--:--"
     st.markdown(
-        f'<div class="bvc-panel"><div class="bvc-panel-title">◆ Target acquisition · IV−RV</div>{header}{rows}</div>',
+        f'<div class="bvc-panel"><div class="bvc-panel-title">◆ Target acquisition · IV−RV'
+        f'<span style="float:right;letter-spacing:.06em">{stamp}</span></div>{header}{rows}</div>',
         unsafe_allow_html=True,
     )
 
@@ -675,14 +742,14 @@ def render_scanner(bot: TradingBot) -> None:
             except BrokerError as exc:
                 st.error(f"Scan failed: {exc}")
 
-    snapshots: List[engine.VRPSnapshot] = st.session_state.get("scan", [])
+    # Same source as the deck, so a scan run from either place shows in both.
+    snapshots, scanned_at, source = latest_scan(bot)
     if not snapshots:
         st.info("No scan yet. Run one above, or start the bot to populate it automatically.")
         return
 
-    scanned_at = st.session_state.get("scan_at")
     if scanned_at:
-        st.caption(f"Scanned {scanned_at.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        st.caption(f"Scanned {scanned_at.strftime('%Y-%m-%d %H:%M:%S')} UTC · {source}")
 
     qualified = [s for s in snapshots if s.is_tradeable]
     columns = st.columns(3)
