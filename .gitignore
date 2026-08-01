@@ -1,0 +1,14 @@
+# Runtime state — trade log, IV history, bot halt flag, FX cache
+state/
+
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
