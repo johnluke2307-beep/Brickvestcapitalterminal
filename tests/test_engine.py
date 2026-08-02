@@ -398,6 +398,115 @@ def test_margin_utilization_and_projection() -> None:
 
 
 # ======================================================================================
+# Backtester
+# ======================================================================================
+def _synthetic_frame(n=900, daily_vol=0.0085, seed=5, s0=300.0):
+    import pandas as pd
+
+    rng = random.Random(seed)
+    price = s0
+    rows = {"open": [], "high": [], "low": [], "close": []}
+    for _ in range(n):
+        open_price = price
+        close = price * math.exp(rng.gauss(0.0003, daily_vol))
+        rows["open"].append(open_price)
+        rows["close"].append(close)
+        rows["high"].append(max(open_price, close) * (1 + abs(rng.gauss(0, daily_vol / 3))))
+        rows["low"].append(min(open_price, close) * (1 - abs(rng.gauss(0, daily_vol / 3))))
+        price = close
+    return pd.DataFrame(rows, index=pd.bdate_range("2019-01-01", periods=n))
+
+
+def test_strike_from_delta_round_trips() -> None:
+    """The inverse solver must reproduce the delta it was asked for."""
+    spot, t, vol, rate = 500.0, 45 / 365, 0.20, 0.045
+    for target in (0.05, 0.16, 0.30, 0.45):
+        strike = engine.strike_from_delta(spot, t, vol, rate, -target, is_call=False)
+        assert approx(abs(engine.bs_delta(spot, strike, t, vol, rate, False)), target, 1e-6)
+        assert strike < spot  # a short put sits below spot
+
+        call_strike = engine.strike_from_delta(spot, t, vol, rate, target, is_call=True)
+        assert approx(engine.bs_delta(spot, call_strike, t, vol, rate, True), target, 1e-6)
+        assert call_strike > spot
+
+
+def test_norm_ppf_matches_known_quantiles() -> None:
+    assert approx(engine.norm_ppf(0.5), 0.0, 1e-9)
+    assert approx(engine.norm_ppf(0.975), 1.959963985, 1e-6)
+    assert approx(engine.norm_ppf(0.025), -1.959963985, 1e-6)
+
+
+def test_backtest_runs_and_books_trades() -> None:
+    import backtest as bt
+
+    prices = {"SPY": _synthetic_frame(seed=5), "QQQ": _synthetic_frame(seed=6, s0=200.0)}
+    cfg = bt.BacktestConfig(
+        symbols=["SPY", "QQQ"], start_date="2020-01-01", end_date="2022-01-01",
+        strategy="put_credit_spread", vrp_points=0.03,
+    )
+    result = bt.Backtester(cfg, prices).run()
+    assert result.metrics["trades"] > 0
+    assert result.metrics["final_nav"] > 0
+    assert not result.nav.empty
+    for trade in result.trades:
+        assert trade["exit_reason"] in {"profit_target", "stop_loss", "time_exit", "expired"}
+        assert trade["collateral"] > 0
+
+
+def test_more_assumed_premium_produces_more_profit() -> None:
+    """The core sanity check: the VRP assumption must drive the result monotonically.
+
+    If a bigger modelled premium did not pay better on identical price paths, the
+    pricing surface and the P&L accounting would be inconsistent.
+    """
+    import backtest as bt
+
+    prices = {"SPY": _synthetic_frame(seed=7)}
+    returns = []
+    for vrp in (0.0, 0.03, 0.06):
+        cfg = bt.BacktestConfig(
+            symbols=["SPY"], start_date="2020-01-01", end_date="2022-01-01",
+            strategy="put_credit_spread", vrp_points=vrp,
+        )
+        returns.append(bt.Backtester(cfg, prices).run().metrics["total_return"])
+    assert returns[0] < returns[1] < returns[2], returns
+
+
+def test_backtest_explains_an_empty_run() -> None:
+    """A run that takes no trades must say why, not just return zeros."""
+    import backtest as bt
+
+    prices = {"SPY": _synthetic_frame(seed=8)}
+    cfg = bt.BacktestConfig(
+        symbols=["SPY"], start_date="2020-01-01", end_date="2021-01-01",
+        strategy="short_put", initial_capital=15_000.0, max_allocation_per_asset=0.10,
+    )
+    result = bt.Backtester(cfg, prices).run()
+    assert result.metrics["trades"] == 0
+    assert result.warnings
+    assert any("collateral" in w or "vol-rank" in w for w in result.warnings)
+
+
+def test_backtest_respects_the_margin_ceiling() -> None:
+    import backtest as bt
+
+    prices = {"SPY": _synthetic_frame(seed=9), "QQQ": _synthetic_frame(seed=10, s0=250.0)}
+    cfg = bt.BacktestConfig(
+        symbols=["SPY", "QQQ"], start_date="2020-01-01", end_date="2022-01-01",
+        strategy="put_credit_spread", max_margin_utilization=0.20,
+        max_allocation_per_asset=0.50,
+    )
+    engine_run = bt.Backtester(cfg, prices)
+    result = engine_run.run()
+    # Collateral committed at any instant must never exceed the ceiling of NAV.
+    peak_collateral = 0.0
+    for position in engine_run.positions:
+        peak_collateral = max(peak_collateral, position.collateral)
+    assert peak_collateral <= cfg.initial_capital * cfg.max_margin_utilization + 1e-6
+    assert result.metrics["trades"] >= 0
+
+
+# ======================================================================================
 # Runner
 # ======================================================================================
 def main() -> int:

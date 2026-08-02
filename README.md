@@ -44,12 +44,13 @@ trade, computed from the short strike's delta and the managed exits.
 |---|---|
 | `app.py` | Streamlit dashboard — six tabs, no business logic of its own |
 | `terminal.py` | The same deck in a console, via Rich — for an always-on host |
+| `backtest.py` | Historical replay of the same rules, with the premium assumption exposed |
 | `broker_client.py` | Alpaca connection, account, positions, option chains, order routing, connection health |
 | `engine.py` | Black-Scholes, realised-volatility estimators, VRP, IV Rank, expectancy, USD→ZAR |
 | `bot.py` | The execution loop: preflight → manage → scan → enter |
 | `config.py` | Every tunable, resolved from env vars → `st.secrets` → defaults |
 | `.streamlit/config.toml` | Terminal chrome — dark deck, monospace figures |
-| `requirements.txt` | Five dependencies, all free-tier friendly |
+| `requirements.txt` | Six dependencies, all free-tier friendly |
 | `tests/test_engine.py` | Maths regression tests (no network, no credentials) |
 
 `engine.py` has **no broker dependency** — give it prices, it gives you an edge
@@ -97,6 +98,44 @@ scan appends today's ATM IV to `state/iv_history.csv`; once
 Rank. Before that the terminal ranks current IV against the trailing *realised*
 vol distribution and labels it **"RV proxy — building IV history"** everywhere it
 appears. It is never presented as something it is not.
+
+---
+
+## Backtesting
+
+The **Backtest** tab (and `python backtest.py`) replays the same mechanical rules
+over history, reusing `engine.py` for pricing, volatility and expectancy so a
+backtest and a live cycle are scored by identical code.
+
+**The volatility assumption is the whole ballgame.** No free source carries years
+of historical *implied* volatility, so option prices are modelled. Pricing every
+option at trailing realised vol — the obvious approach — quietly destroys the
+thing being measured: if IV equals RV there is no variance risk premium, the
+seller collects exactly fair value, and the run measures nothing but path luck.
+
+So entries and marks price on a surface of `IV(t) = RV(t) + vrp_points`, where
+`vrp_points` is the premium the market has historically paid over realised vol
+(2–4 points on index products; 3 by default). Profit then comes from the actual
+forward path being calmer than that surface implied, which is the real mechanism.
+
+Set the slider to **0 points** to run the null hypothesis — no edge exists — and
+the tab plots both curves together. If they track each other, the result is path
+luck rather than edge. Always look at both.
+
+```bash
+python backtest.py --strategy put_credit_spread --vrp 0.03
+python backtest.py --strategy put_credit_spread --vrp 0     # the null
+```
+
+What it does **not** model: bid/ask spread, early assignment, dividend and pin
+risk, volatility skew across strikes, or whether a strike was actually listed and
+liquid. Real fills are worse than these. Treat the output as a sanity check on the
+rules, never as a forecast.
+
+A note on capital: a cash-secured put ties up `strike × 100` — about $28,000 on a
+$280 ETF — so a $100k account cannot hold many. Defined-risk spreads post only the
+wing width and show dramatically better return on capital for the same rules. When
+a run takes no trades it names the binding constraint rather than returning zeros.
 
 ---
 

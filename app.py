@@ -10,6 +10,7 @@ Six tabs:
     Scanner    — the VRP edge, per symbol, with the reason anything was rejected
     Positions  — live short premium with its managed bracket levels
     Trade log  — realised record and the expectancy formula it produces
+    Backtest   — the same rules replayed over history, premium assumption exposed
     Bot        — start/stop, halt state, and the event feed
     Settings   — every guardrail currently in force
 
@@ -19,6 +20,7 @@ app at this file and put the Alpaca keys in the Secrets panel.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -1087,6 +1089,219 @@ def render_bot_console(bot: TradingBot) -> None:
 
 
 # ======================================================================================
+# Tab — Backtest
+# ======================================================================================
+def render_backtest(bot: TradingBot) -> None:
+    """Replay the configured rules over history, with the VRP assumption exposed."""
+    import backtest as bt
+
+    st.markdown('<div class="bvc-panel-title">◈ Historical replay</div>', unsafe_allow_html=True)
+    st.caption(
+        "The same rules the bot trades, run over historical prices. Option prices are modelled — "
+        "no free source carries years of historical implied volatility — so the premium assumption "
+        "below is the single most important input on this page."
+    )
+
+    defaults = bt.BacktestConfig.from_settings(bot.settings)
+    universe = sorted(set(bot.settings.universe) | {"SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "EEM", "XLF"})
+
+    row1 = st.columns([2.2, 1, 1, 1.4])
+    symbols = row1[0].multiselect("Symbols", universe, default=[s for s in defaults.symbols if s in universe][:2])
+    start = row1[1].text_input("Start", defaults.start_date)
+    end = row1[2].text_input("End", defaults.end_date)
+    strategy = row1[3].selectbox(
+        "Strategy", ["short_put", "put_credit_spread", "iron_condor"],
+        index=["short_put", "put_credit_spread", "iron_condor"].index(defaults.strategy),
+    )
+
+    row2 = st.columns(4)
+    short_delta = row2[0].slider("Short delta", 0.05, 0.45, float(defaults.short_delta), 0.01)
+    dte_entry = row2[1].slider("Entry DTE", 20, 60, int(defaults.dte_entry), 1)
+    dte_exit = row2[2].slider("Time exit DTE", 0, 30, int(defaults.dte_exit), 1)
+    vol_rank = row2[3].slider("Min vol rank", 0.0, 90.0, float(defaults.vol_rank_threshold), 5.0)
+
+    row3 = st.columns(4)
+    profit_target = row3[0].slider("Profit target", 0.10, 0.90, float(defaults.profit_target), 0.05)
+    stop_loss = row3[1].slider("Stop (× credit)", 0.5, 5.0, float(defaults.stop_loss), 0.25)
+    capital = row3[2].number_input("Capital ($)", 10_000, 5_000_000, int(defaults.initial_capital), 10_000)
+    per_asset = row3[3].slider("Max per asset", 0.05, 0.50, float(defaults.max_allocation_per_asset), 0.05)
+
+    # The assumption that decides whether this measures an edge or measures noise.
+    row4 = st.columns([2, 2, 2])
+    vrp_points = row4[0].slider(
+        "IV premium over RV (vol points)", 0.0, 8.0, float(defaults.vrp_points * 100), 0.5,
+        help="Implied vol is modelled as realised vol plus this. Index options have historically "
+             "paid 2–4 points. Zero means no variance risk premium exists.",
+    ) / 100.0
+    compare_null = row4[1].checkbox(
+        "Also run the null hypothesis (0 points)", value=True,
+        help="Runs the identical backtest with no premium. If the two curves look alike, "
+             "the result is path luck rather than edge.",
+    )
+    run = row4[2].button("◈ RUN BACKTEST", use_container_width=True, type="primary")
+
+    if run:
+        if not symbols:
+            st.error("Pick at least one symbol.")
+            return
+        cfg = bt.BacktestConfig(
+            symbols=symbols, start_date=start, end_date=end, strategy=strategy,
+            short_delta=short_delta, dte_entry=dte_entry, dte_exit=dte_exit,
+            vol_rank_threshold=vol_rank, profit_target=profit_target, stop_loss=stop_loss,
+            initial_capital=float(capital), max_allocation_per_asset=per_asset,
+            vrp_points=vrp_points, risk_free_rate=bot.settings.risk_free_rate,
+            max_margin_utilization=bot.settings.max_margin_utilization,
+        )
+        try:
+            with st.spinner("Loading history and replaying…"):
+                result = bt.run_backtest(cfg, broker=bot.client if bot.client.is_connected else None)
+                null = None
+                if compare_null and vrp_points > 0:
+                    null_cfg = replace(cfg, vrp_points=0.0)
+                    null = bt.run_backtest(null_cfg, broker=bot.client if bot.client.is_connected else None)
+            st.session_state["bt_result"] = result
+            st.session_state["bt_null"] = null
+        except Exception as exc:
+            st.error(f"BACKTEST FAILED — {exc}")
+            st.caption(
+                "History comes from yfinance, falling back to the broker feed. If this host blocks "
+                "outbound HTTP, neither is reachable."
+            )
+            return
+
+    result = st.session_state.get("bt_result")
+    if result is None:
+        st.info("Set the parameters above and press RUN BACKTEST.")
+        return
+
+    render_backtest_results(result, st.session_state.get("bt_null"), bot)
+
+
+def render_backtest_results(result, null, bot: TradingBot) -> None:
+    """Metric strip, equity curve, drawdown and the trade record."""
+    palette = theme()
+    m = result.metrics
+    fx_quote = bot.fx.get_rate()
+
+    cells = [
+        ("TOTAL RETURN", _signed(m["total_return"] * 100, palette) + "%"),
+        ("CAGR", f'{m["cagr"] * 100:.2f}%'),
+        ("SHARPE", f'{m["sharpe"]:.2f}'),
+        ("MAX DD", f'<span class="t-crit">{m["max_drawdown"] * 100:.1f}%</span>'),
+        ("TRADES", f'{m["trades"]}'),
+        ("WIN RATE", f'{m["win_rate"] * 100:.0f}% / {m["breakeven_win_rate"] * 100:.0f}%'),
+        ("E / TRADE", _signed(m["expectancy"], palette, "$")),
+        ("FINAL NAV", f'${m["final_nav"]:,.0f}'),
+    ]
+    html = "".join(f'<div class="bvc-cell"><div class="k">{k}</div><div class="v">{v}</div></div>' for k, v in cells)
+    st.markdown(f'<div class="bvc-strip">{html}</div>', unsafe_allow_html=True)
+
+    monthly_zar = (m["expectancy"] * m["trades"] / max(m["years"] * 12, 1e-9)) * fx_quote.rate
+    st.markdown(
+        f'<div class="bvc-footer">{m["start"]} → {m["end"]} · {m["years"]:.1f} yrs · '
+        f'avg hold {m["avg_days_held"]:.0f} days · '
+        f'implied ≈ <b>R{monthly_zar:,.0f}/month</b> at {fx_quote.rate:.2f} '
+        f'(target R{bot.settings.monthly_target_zar:,.0f})</div>',
+        unsafe_allow_html=True,
+    )
+
+    if m["trades"] and m["win_rate"] < m["breakeven_win_rate"] and m["expectancy"] > 0:
+        # Not a contradiction: the breakeven rate assumes every trade ends at
+        # the target or the stop. The time exit is a third outcome that closes
+        # positions at a partial profit or loss, so the realised win/loss
+        # magnitudes differ from the nominal geometry.
+        st.caption(
+            f"Win rate {m['win_rate']:.0%} sits below the {m['breakeven_win_rate']:.0%} nominal hurdle yet "
+            "expectancy is positive — the hurdle assumes every trade ends at the target or the stop, while "
+            f"the {result.config.dte_exit}-DTE time exit closes positions partway, changing the average "
+            "win and loss."
+        )
+
+    for note in result.warnings:
+        st.warning(note)
+
+    left, right = st.columns([3, 2])
+    with left:
+        st.markdown('<div class="bvc-panel-title">Equity curve</div>', unsafe_allow_html=True)
+        render_equity_curve(result, null)
+    with right:
+        st.markdown('<div class="bvc-panel-title">Drawdown</div>', unsafe_allow_html=True)
+        render_drawdown(result)
+
+    if not result.trades:
+        return
+
+    st.markdown('<div class="bvc-panel-title">Trades</div>', unsafe_allow_html=True)
+    mix = {}
+    for trade in result.trades:
+        mix[trade["exit_reason"]] = mix.get(trade["exit_reason"], 0) + 1
+    st.caption(" · ".join(f"{k.replace('_', ' ')}: {v}" for k, v in sorted(mix.items(), key=lambda kv: -kv[1])))
+
+    frame = pd.DataFrame(result.trades)
+    st.dataframe(frame, use_container_width=True, hide_index=True, height=320)
+    st.download_button(
+        "Download backtest trades (CSV)",
+        data=frame.to_csv(index=False).encode(),
+        file_name="brickvest_backtest_trades.csv",
+        mime="text/csv",
+    )
+
+
+def render_equity_curve(result, null) -> None:
+    """NAV over time. Two series when the null hypothesis was run alongside."""
+    palette = theme()
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=result.nav.index, y=result.nav.values, mode="lines", name="With VRP",
+            line=dict(color=palette["series_1"], width=2),
+            hovertemplate="%{x|%Y-%m-%d}<br>$%{y:,.0f}<extra>With VRP</extra>",
+        )
+    )
+    if null is not None and not null.nav.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=null.nav.index, y=null.nav.values, mode="lines", name="Null (no VRP)",
+                line=dict(color=palette["series_2"], width=2),
+                hovertemplate="%{x|%Y-%m-%d}<br>$%{y:,.0f}<extra>Null</extra>",
+            )
+        )
+    fig.add_hline(
+        y=result.config.initial_capital,
+        line=dict(color=palette["muted"], width=1, dash="dot"),
+        annotation_text="Starting capital", annotation_position="bottom right",
+        annotation_font=dict(color=palette["muted"], size=11),
+    )
+    fig.update_layout(hovermode="x unified")
+    st.plotly_chart(
+        style_figure(fig, height=340, showlegend=len(fig.data) > 1),
+        use_container_width=True, config={"displayModeBar": False},
+    )
+    if null is not None:
+        st.caption(
+            "Two curves, one difference: the assumed premium. If they track each other, the strategy "
+            "is not harvesting an edge in this window."
+        )
+
+
+def render_drawdown(result) -> None:
+    palette = theme()
+    series = result.metrics.get("drawdown_series")
+    if series is None or series.empty:
+        st.caption("No drawdown data.")
+        return
+    fig = go.Figure(
+        go.Scatter(
+            x=series.index, y=series.values * 100, mode="lines",
+            line=dict(color=palette["critical"], width=1.5),
+            fill="tozeroy", fillcolor="rgba(208,59,59,0.18)",
+            hovertemplate="%{x|%Y-%m-%d}<br>%{y:.1f}%<extra></extra>",
+        )
+    )
+    st.plotly_chart(style_figure(fig, height=340), use_container_width=True, config={"displayModeBar": False})
+
+
+# ======================================================================================
 # Tab 6 — Settings
 # ======================================================================================
 def render_settings(bot: TradingBot) -> None:
@@ -1193,7 +1408,7 @@ def main() -> None:
     if not bot.settings.paper:
         st.warning("⚠️ Live trading mode is enabled. Orders will be sent to a funded account.")
 
-    tabs = st.tabs(["Deck", "Scanner", "Positions", "Trade log", "Bot", "Settings"])
+    tabs = st.tabs(["Deck", "Scanner", "Positions", "Trade log", "Backtest", "Bot", "Settings"])
     with tabs[0]:
         render_deck(bot)
     with tabs[1]:
@@ -1203,8 +1418,10 @@ def main() -> None:
     with tabs[3]:
         render_trade_log(bot)
     with tabs[4]:
-        render_bot_console(bot)
+        render_backtest(bot)
     with tabs[5]:
+        render_bot_console(bot)
+    with tabs[6]:
         render_settings(bot)
 
 

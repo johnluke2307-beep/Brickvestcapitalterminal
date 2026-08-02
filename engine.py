@@ -129,6 +129,32 @@ def implied_vol(
     return 0.5 * (lo + hi)
 
 
+def norm_ppf(p: float) -> float:
+    """Inverse standard normal CDF, via the stdlib — no SciPy on the free tier."""
+    return statistics.NormalDist().inv_cdf(min(max(p, 1e-12), 1 - 1e-12))
+
+
+def strike_from_delta(
+    spot: float,
+    t: float,
+    vol: float,
+    rate: float,
+    target_delta: float,
+    is_call: bool,
+) -> float:
+    """Invert Black-Scholes delta for a strike — closed form, no root-finding.
+
+    Calls: ``Δ = N(d1)`` so ``d1 = N⁻¹(Δ)``.
+    Puts:  ``Δ = N(d1) − 1`` so ``d1 = N⁻¹(Δ + 1)`` (pass Δ negative).
+
+    Then ``K = S · exp(−d1·σ√T + (r + σ²/2)·T)``.
+    """
+    if spot <= 0 or t <= 0 or vol <= 0:
+        return spot
+    d1 = norm_ppf(target_delta if is_call else target_delta + 1.0)
+    return spot * math.exp(-d1 * vol * math.sqrt(t) + (rate + 0.5 * vol * vol) * t)
+
+
 def year_fraction(expiration: date, asof: Optional[date] = None) -> float:
     """Calendar-day year fraction, floored so same-day expiries stay finite."""
     asof = asof or datetime.now(timezone.utc).date()
