@@ -37,7 +37,9 @@ st.set_page_config(
     page_title="Brickvestcapitalterminal",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded",
+    # "auto" collapses the sidebar on narrow screens. Forcing it open makes it
+    # overlay the deck on a phone and swallow taps meant for the tabs.
+    initial_sidebar_state="auto",
 )
 
 OPTION_MULTIPLIER = 100
@@ -153,6 +155,15 @@ def inject_terminal_css() -> None:
               background-color: {p["panel"]} !important; color: {p["text"]} !important;
           }}
           [data-baseweb="select"] svg {{ fill: {p["muted"]}; }}
+          /* Seven tabs overflow a phone-width viewport, and Streamlit gives the
+             strip no visible scroll affordance — the later tabs (Backtest, Bot,
+             Settings) simply vanish. Wrapping keeps every tab reachable. */
+          [data-testid="stTabs"] [role="tablist"] {{
+              flex-wrap: wrap !important;
+              overflow-x: visible !important;
+              row-gap: .1rem;
+          }}
+          [data-testid="stTabs"] [role="tab"] {{ white-space: nowrap; }}
           /* Figures in tables, metrics and code align only with tabular numerals. */
           [data-testid="stMetricValue"], [data-testid="stDataFrame"], .bvc-mono {{
               font-family: {MONO};
