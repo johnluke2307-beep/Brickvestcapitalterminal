@@ -49,6 +49,7 @@ trade, computed from the short strike's delta and the managed exits.
 | `ibkr_client.py` | Interactive Brokers via ib_async — resting brackets, real IV history |
 | `engine.py` | Black-Scholes, realised-volatility estimators, VRP, IV Rank, expectancy, USD→ZAR |
 | `bot.py` | The execution loop: preflight → manage → scan → enter |
+| `hermes.py` | Control surface for an external self-improvement agent |
 | `config.py` | Every tunable, resolved from env vars → `st.secrets` → defaults |
 | `.streamlit/config.toml` | Terminal chrome — dark deck, monospace figures |
 | `requirements.txt` | Six dependencies, all free-tier friendly |
@@ -220,6 +221,45 @@ A note on capital: a cash-secured put ties up `strike × 100` — about $28,000 
 $280 ETF — so a $100k account cannot hold many. Defined-risk spreads post only the
 wing width and show dramatically better return on capital for the same rules. When
 a run takes no trades it names the binding constraint rather than returning zeros.
+
+---
+
+## Hermes — the agent control surface
+
+`hermes.py` is the integration point for an external self-improvement agent. It
+observes, proposes changes, and can stop the bot — through one narrow, audited
+interface rather than by reaching into `TradingBot`.
+
+```python
+from hermes import HermesControl
+hermes = HermesControl(bot)
+
+state   = hermes.observe()                     # everything, structured
+verdict = hermes.propose({"target_delta": 0.25},
+                         rationale="OOS Sharpe +0.31 across 4 folds",
+                         evidence={"out_of_sample_validated": True})
+hermes.halt("drawdown breach")                 # always permitted
+```
+
+Or over JSON from another process: `python hermes.py observe`,
+`python hermes.py bounds`, `echo '{...}' | python hermes.py propose`.
+
+**The contract is deliberately asymmetric — reads wide, writes narrow:**
+
+| Invariant | Why |
+|---|---|
+| **Risk limits ratchet one way** | The agent may tighten a guardrail, never loosen it — whatever the rationale. A system optimising "make more money" reads a margin ceiling as an obstacle. The worst case of a misaligned Hermes is an account that trades too little. |
+| **Halt always, resume never** | Stopping needs no permission. Clearing a halt stays a human act, because the halt exists for exactly the conditions the automation misread. |
+| **Fixed mutable set** | Venue, universe, credentials and the paper/live flag are not the agent's to change. Promoting to live is a human decision by construction. |
+| **Rationale required** | Every proposal carries one, and every proposal — accepted or rejected — is appended to `state/hermes_audit.jsonl` before anything changes. |
+| **Off by default** | `BVC_HERMES_ENABLED=true` is required before anything can change how this trades. |
+
+**Overfitting is the failure mode this is designed against.** An agent tuning
+parameters against the backtester is an automated multiple-comparison machine.
+So the surface counts every distinct configuration proposed — including the ones
+adopted — and returns that count, plus a blunt `evidence_quality` verdict, on
+every observation. An agent given only performance numbers will optimise them;
+this one is also handed the reasons not to act.
 
 ---
 

@@ -829,6 +829,166 @@ def test_iv_backfill_never_overwrites_an_existing_observation() -> None:
 
 
 # ======================================================================================
+# Hermes control surface
+# ======================================================================================
+def _hermes_pair(tmp_name: str):
+    """A bot on a stub broker, plus a Hermes bound to its own audit file."""
+    import threading
+
+    import config as cfgmod
+    from bot import TradingBot
+    from broker_client import AccountSnapshot, BrokerCapabilities, BrokerClient, ConnectionHealth
+    from hermes import HermesAudit, HermesControl
+
+    class Stub(BrokerClient):
+        def __init__(self, settings):
+            self.settings = settings
+            self.health = ConnectionHealth(connected=True, last_ok=datetime.now(timezone.utc))
+            self._lock = threading.RLock()
+            self.capabilities = BrokerCapabilities(name="alpaca")
+
+        def connect(self): return True
+        @property
+        def is_connected(self): return True
+        def get_account(self):
+            return AccountSnapshot(equity=100_000.0, maintenance_margin=20_000.0)
+        def get_positions(self): return []
+        def get_option_positions(self): return []
+
+    settings = cfgmod.load_settings()
+    bot = TradingBot(client=Stub(settings), settings=settings)
+    bot.state.mode = "idle"
+    bot.state.halt_reason = None
+    audit = HermesAudit(Path(os.environ["BVC_STATE_DIR"]) / f"hermes_{tmp_name}.jsonl")
+    return bot, HermesControl(bot, audit=audit, enabled=True), settings
+
+
+def test_hermes_cannot_loosen_a_risk_limit() -> None:
+    """The ratchet. A misaligned agent must only be able to trade less.
+
+    Checked with a value *inside* the permitted range, so the rejection can only
+    come from the one-way rule rather than incidentally from bounds.
+    """
+    bot, hermes, settings = _hermes_pair("ratchet")
+    settings.max_margin_utilization = 0.30
+
+    verdict = hermes.propose(
+        {"max_margin_utilization": 0.45},
+        rationale="raising the ceiling would let more capital be deployed",
+    )
+    assert not verdict.accepted
+    assert "ratchet" in verdict.rejected["max_margin_utilization"]
+    assert settings.max_margin_utilization == 0.30  # untouched
+
+    tighten = hermes.propose(
+        {"max_margin_utilization": 0.20},
+        rationale="reduce exposure after a run of losses",
+    )
+    assert tighten.accepted
+    assert settings.max_margin_utilization == 0.20
+
+
+def test_hermes_cannot_touch_what_is_not_listed() -> None:
+    """Promoting to live, changing venue or universe are not the agent's to make."""
+    bot, hermes, settings = _hermes_pair("immutable")
+    verdict = hermes.propose(
+        {"paper": False, "broker": "ibkr", "universe": ["TSLA"], "alpaca_api_key": "x"},
+        rationale="switch to live trading on a new venue for better fills",
+    )
+    assert not verdict.accepted
+    assert set(verdict.rejected) == {"paper", "broker", "universe", "alpaca_api_key"}
+    assert settings.paper is True
+
+
+def test_hermes_may_halt_but_never_resume() -> None:
+    """Stopping needs no permission; clearing a halt is a human act."""
+    bot, hermes, settings = _hermes_pair("halt")
+
+    assert hermes.halt("drawdown breach")["halted"]
+    assert bot.state.is_halted
+
+    assert hermes.start("please resume")["started"] is False
+    assert bot.state.is_halted
+
+    blocked = hermes.propose({"target_delta": 0.30}, rationale="retune after the halt")
+    assert not blocked.accepted
+    assert "halted" in blocked.rejected["*"]
+
+
+def test_hermes_applies_the_legal_part_of_a_mixed_proposal() -> None:
+    """A specific reason per parameter, so the agent can learn from a refusal."""
+    bot, hermes, settings = _hermes_pair("mixed")
+    verdict = hermes.propose(
+        {"target_delta": 0.22, "max_open_positions": 99, "nonsense": 1},
+        rationale="tighten delta while widening concurrent positions",
+    )
+    assert verdict.applied == {"target_delta": 0.22}
+    assert "max_open_positions" in verdict.rejected
+    assert "nonsense" in verdict.rejected
+    assert approx(settings.target_delta, 0.22, 1e-9)
+
+
+def test_hermes_requires_a_rationale() -> None:
+    bot, hermes, _ = _hermes_pair("rationale")
+    assert not hermes.propose({"target_delta": 0.25}, rationale="").accepted
+    assert not hermes.propose({"target_delta": 0.25}, rationale="tweak").accepted
+
+
+def test_hermes_counts_every_configuration_tried() -> None:
+    """The multiple-comparison counter must include *applied* changes.
+
+    Counting only rejected proposals would report a tuning agent as having
+    searched nothing, which is precisely backwards.
+    """
+    bot, hermes, _ = _hermes_pair("experiments")
+    for delta in (0.22, 0.25, 0.28, 0.25):  # three distinct, one repeat
+        hermes.propose({"target_delta": delta}, rationale="sweeping delta for a better result")
+
+    quality = hermes.observe()["evidence_quality"]
+    assert quality["configurations_tried"] == 3
+    assert quality["verdict"] != "adequate"  # no closed trades to justify any of it
+
+
+def test_hermes_observation_carries_the_counterweights() -> None:
+    """The payload must include what argues against acting, not just performance."""
+    bot, hermes, _ = _hermes_pair("observe")
+    state = hermes.observe()
+
+    assert state["hermes"]["may_resume_after_halt"] is False
+    assert "evidence_quality" in state
+    assert "mutable_parameters" in state["hermes"]
+    assert "max_margin_utilization" in state["hermes"]["mutable_parameters"]
+    assert state["hermes"]["mutable_parameters"]["max_margin_utilization"]["ratcheted"] is True
+    assert "paper" not in state["hermes"]["mutable_parameters"]
+
+
+def test_hermes_is_off_until_switched_on() -> None:
+    """Nothing may change how this trades until it is deliberately enabled."""
+    import config as cfgmod
+    from hermes import HermesControl
+
+    bot, _, settings = _hermes_pair("disabled")
+    disabled = HermesControl(bot, enabled=False)
+    verdict = disabled.propose({"target_delta": 0.25}, rationale="a perfectly reasonable adjustment")
+    assert not verdict.accepted
+    assert "disabled" in verdict.rejected["*"]
+    assert cfgmod.load_settings().hermes_enabled in (True, False)
+
+
+def test_hermes_audit_records_rejections_too() -> None:
+    """The record must show what was refused, not only what happened."""
+    bot, hermes, _ = _hermes_pair("audit")
+    hermes.propose({"max_margin_utilization": 0.99}, rationale="deploy substantially more capital")
+    history = hermes.history()
+    assert history
+    last = history[-1]
+    assert last["kind"] in {"propose", "apply"}
+    assert last["accepted"] is False
+    assert last["rejections"]
+    assert "deploy substantially more capital" in last["rationale"]
+
+
+# ======================================================================================
 # Runner
 # ======================================================================================
 def main() -> int:

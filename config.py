@@ -188,6 +188,11 @@ class Settings:
     iv_rank_min_samples: int = field(default_factory=lambda: _int("BVC_IV_RANK_MIN_SAMPLES", 40))
     #: Seconds between automated bot cycles.
     loop_interval_seconds: int = field(default_factory=lambda: _int("BVC_LOOP_INTERVAL", 300))
+    # ---------------------------------------------------------------- hermes
+    #: Master switch for the external self-improvement agent. Off by default:
+    #: nothing may change how this trades until it is turned on deliberately.
+    hermes_enabled: bool = field(default_factory=lambda: _bool("BVC_HERMES_ENABLED", False))
+
     #: When true the bot scans, scores and logs but never sends an order.
     dry_run: bool = field(default_factory=lambda: _bool("BVC_DRY_RUN", False))
 
