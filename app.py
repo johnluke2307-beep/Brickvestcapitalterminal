@@ -382,7 +382,7 @@ def render_sidebar(bot: TradingBot) -> None:
     settings = bot.settings
     with st.sidebar:
         st.markdown("### BVC Terminal")
-        st.caption("Brickvestcapitalterminal · variance risk premium · Alpaca")
+        st.caption(f"Brickvestcapitalterminal · variance risk premium · {bot.client.capabilities.name}")
 
         # ---- link state --------------------------------------------------
         health = bot.client.health
@@ -727,10 +727,16 @@ def render_risk_manager(bot: TradingBot, fx_quote) -> None:
         f"{header}{body}</div>",
         unsafe_allow_html=True,
     )
-    st.caption(
-        "Brackets are enforced by the bot each cycle, not resting at the exchange — "
-        "Alpaca does not accept bracket orders on option legs. A stopped bot means unmanaged positions."
-    )
+    if getattr(bot.client.capabilities, "native_brackets", False):
+        st.caption(
+            "Brackets rest at the exchange as OCA groups, so the profit target and stop survive this "
+            "process stopping. The bot still owns the time exit, which no exchange order can express."
+        )
+    else:
+        st.caption(
+            "Brackets are enforced by the bot each cycle, not resting at the exchange — "
+            "Alpaca does not accept bracket orders on option legs. A stopped bot means unmanaged positions."
+        )
 
 
 def render_expectancy_panel(expectancy, account, settings, palette) -> None:
@@ -1714,6 +1720,9 @@ def render_settings(bot: TradingBot) -> None:
             ("Max new positions / day", str(settings.max_new_positions_per_day)),
             ("One position per underlying", "yes" if settings.one_position_per_underlying else "no"),
             ("Liquidity filter", f"credit ≥ {fmt_usd(settings.min_credit_usd)}, spread ≤ {settings.max_spread_pct:.0%} of mid"),
+            ("Venue", f"{bot.client.capabilities.name} · "
+                      f"{'resting exchange brackets' if bot.client.capabilities.native_brackets else 'bot-managed brackets'} · "
+                      f"{'real IV history' if bot.client.capabilities.historical_iv else 'IV history built locally'}"),
             ("Fail-safe", "any broker or data failure halts the bot and flags the UI"),
             ("Dry run", "ON — no orders sent" if settings.dry_run else "off"),
         ],
@@ -1791,7 +1800,7 @@ def main() -> None:
           <span style="font-size:.63rem;letter-spacing:.13em;color:{palette['muted']};">
             VRP&nbsp;·&nbsp;{bot.settings.target_dte}D&nbsp;·&nbsp;{bot.settings.target_delta:.2f}&Delta;
             &nbsp;·&nbsp;IVR&gt;{bot.settings.min_iv_rank:.0f}
-            &nbsp;·&nbsp;ALPACA&nbsp;{'PAPER' if bot.settings.paper else 'LIVE'}
+            &nbsp;·&nbsp;{bot.client.capabilities.name.upper()}&nbsp;{'PAPER' if bot.settings.paper else 'LIVE'}
           </span>
           <span style="font-size:.68rem;letter-spacing:.12em;font-variant-numeric:tabular-nums;">
             <span style="color:{session_colour};font-weight:700;">{session}</span>

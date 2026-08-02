@@ -10,3 +10,7 @@ pandas>=2.0                 # tabular views only
 plotly>=5.20,<7.0           # charts
 rich>=13.0,<15.0            # console deck (terminal.py)
 yfinance>=0.2.40            # historical prices for the backtester
+
+# Interactive Brokers (optional — only needed when BVC_BROKER=ibkr).
+# ib_async is the maintained successor to ib_insync, which was archived in 2024.
+ib_async>=2.0,<3.0          # IBKR connector: resting brackets + historical IV

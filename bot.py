@@ -180,6 +180,7 @@ class TradingBot:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.last_result: Optional[CycleResult] = None
+        self._iv_seeded = False
 
     # ---------------------------------------------------------------- fail-safe
     def halt(self, reason: str) -> None:
@@ -292,6 +293,15 @@ class TradingBot:
             result.halted, result.ok = True, False
             result.reason = "degraded data feed"
             return None
+
+        # One backfill per process: a year of real IV is a big request and the
+        # store already refuses to overwrite what it holds.
+        if not self._iv_seeded:
+            self._iv_seeded = True
+            try:
+                self._seed_iv_history()
+            except Exception as exc:  # never let a backfill stop a trading cycle
+                logger.warning("IV backfill skipped: %s", exc)
 
         self.state.mode = "running"
         return account
@@ -427,8 +437,19 @@ class TradingBot:
         Entry credit comes from the trade log when the position was opened by
         this bot, and from the broker's average entry price otherwise — so
         positions opened by hand are still managed rather than ignored.
+
+        When the broker holds a real bracket, the profit target and stop are
+        already resting at the exchange and must not be fired again here: doing
+        so would buy the contract back twice. Only the time exit, which no
+        exchange can express, stays with the bot.
         """
         settings = self.settings
+        record_native = self._live_record(position.symbol)
+        exchange_held = (
+            getattr(self.client.capabilities, "native_brackets", False)
+            and record_native is not None
+            and "native bracket" in str(record_native.get("note", ""))
+        )
         record = self._live_record(position.symbol)
         try:
             credit = float(record["credit"]) if record and record.get("credit") else abs(position.avg_entry_price)
@@ -441,10 +462,11 @@ class TradingBot:
         profit_trigger = credit * (1.0 - settings.profit_target_pct)
         stop_trigger = credit * settings.stop_loss_price_multiple
 
-        if price > 0 and price <= profit_trigger:
-            return ("profit_target", profit_trigger)
-        if price >= stop_trigger:
-            return ("stop_loss", stop_trigger)
+        if not exchange_held:
+            if price > 0 and price <= profit_trigger:
+                return ("profit_target", profit_trigger)
+            if price >= stop_trigger:
+                return ("stop_loss", stop_trigger)
         if position.dte is not None and position.dte <= settings.time_exit_dte:
             return ("time_exit", price)
         return None
@@ -501,6 +523,31 @@ class TradingBot:
         if not self.client.is_connected and not self.client.connect():
             raise BrokerError(self.client.health.last_error or "broker unreachable")
         return self._scan_universe()
+
+    def _seed_iv_history(self) -> int:
+        """Backfill the local IV store from the broker's own IV series.
+
+        Turns IV Rank from a realised-vol proxy into a true trailing-range
+        statistic the moment a venue that carries historical implied volatility
+        is connected. No-op on venues that do not.
+        """
+        if not (self.settings.use_broker_iv_history
+                and getattr(self.client.capabilities, "historical_iv", False)):
+            return 0
+        seeded = 0
+        for symbol in self.settings.universe:
+            try:
+                series = self.client.get_iv_history(symbol, lookback_days=self.settings.iv_rank_window + 60)
+            except (BrokerError, AttributeError) as exc:
+                self.state.log_event("info", f"IV history unavailable for {symbol}: {exc}")
+                continue
+            for stamp, iv in series:
+                if stamp and iv:
+                    self.iv_store.record_on(symbol, stamp, float(iv))
+                    seeded += 1
+        if seeded:
+            self.state.log_event("info", f"seeded {seeded} real IV observations from the broker")
+        return seeded
 
     def _scan_universe(self) -> List[engine.VRPSnapshot]:
         """Score every symbol for the variance risk premium."""
@@ -754,9 +801,24 @@ class TradingBot:
             self.state.log_event("info", f"{snapshot.symbol}: net credit ${credit:.2f} below the minimum")
             return None
 
+        take_profit = round(credit * (1 - settings.profit_target_pct), 2)
+        stop_price = round(credit * settings.stop_loss_price_multiple, 2)
+        native = getattr(self.client.capabilities, "native_brackets", False)
+
         # ---- send the order ------------------------------------------------
         if settings.dry_run:
             order = {"status": "dry_run", "symbol": contract.symbol, "qty": contracts}
+        elif native and long_leg is None:
+            # The exits rest at the exchange, so they survive this process
+            # dying. That is the whole reason to run IBKR.
+            order = self.client.submit_bracketed_short(
+                symbol=contract.symbol,
+                qty=contracts,
+                credit=round(credit, 2),
+                take_profit=max(take_profit, 0.01),
+                stop_loss=stop_price,
+                client_order_id=f"bvc-o-{trade_id}",
+            )
         elif long_leg is not None:
             order = self.client.submit_vertical_spread(
                 short_symbol=contract.symbol,
@@ -796,7 +858,8 @@ class TradingBot:
                 "usd_zar": f"{quote.rate:.4f}",
                 "status": "open",
                 "note": (
-                    f"managed bracket: take profit {fill * (1 - settings.profit_target_pct):.2f}, "
+                    f"{'native' if order.get('bracket') else 'managed'} bracket: "
+                    f"take profit {fill * (1 - settings.profit_target_pct):.2f}, "
                     f"stop {fill * settings.stop_loss_price_multiple:.2f}"
                     + (f", long wing {long_leg.symbol}" if long_leg else "")
                 ),
@@ -825,6 +888,7 @@ class TradingBot:
             "expectancy_usd": expected.expectancy,
             "p_win_delta": expected.p_win,
             "p_win_breakeven": expected.breakeven_p_win,
+            "native_bracket": bool(order.get("bracket")),
             "order": order,
         }
 

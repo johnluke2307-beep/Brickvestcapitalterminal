@@ -45,7 +45,8 @@ trade, computed from the short strike's delta and the managed exits.
 | `app.py` | Streamlit dashboard — six tabs, no business logic of its own |
 | `terminal.py` | The same deck in a console, via Rich — for an always-on host |
 | `backtest.py` | Historical replay of the same rules, with the premium assumption exposed |
-| `broker_client.py` | Alpaca connection, account, positions, option chains, order routing, connection health |
+| `broker_client.py` | The broker surface + Alpaca implementation, plus the venue factory |
+| `ibkr_client.py` | Interactive Brokers via ib_async — resting brackets, real IV history |
 | `engine.py` | Black-Scholes, realised-volatility estimators, VRP, IV Rank, expectancy, USD→ZAR |
 | `bot.py` | The execution loop: preflight → manage → scan → enter |
 | `config.py` | Every tunable, resolved from env vars → `st.secrets` → defaults |
@@ -76,7 +77,34 @@ enter     ─── best qualifying candidate, subject to every guardrail
 
 These are deliberate, and each one is visible in the UI rather than hidden.
 
-**1. Alpaca replaces IBKR.** IBKR's API requires a running TWS or IB Gateway
+**Either venue, chosen by `BVC_BROKER`.** Both implement one interface, and the
+bot reads a `BrokerCapabilities` object rather than assuming what a venue can do.
+
+| | Alpaca | IBKR |
+|---|---|---|
+| Gateway process | none | TWS or IB Gateway must be running |
+| Free hosting | yes | no — needs an always-on host |
+| Brackets on options | bot-managed each cycle | **resting at the exchange (OCA)** |
+| Historical implied vol | none — IV Rank uses an RV proxy | **yes, backfilled into IV Rank** |
+| Credentials | API key pair | authenticated at the gateway |
+
+```bash
+BVC_BROKER=ibkr IBKR_PORT=7497 python bot.py --loop     # paper TWS
+BVC_BROKER=ibkr IBKR_PORT=4002 streamlit run app.py     # paper Gateway
+```
+
+Ports: 7497 paper TWS · 7496 live TWS · 4002 paper Gateway · 4001 live Gateway.
+In TWS enable **API → Settings → Enable ActiveX and Socket Clients**.
+
+Two things change materially on IBKR. The 50%/200% pair becomes a real OCA
+bracket held by IBKR, so **a stopped bot no longer means unmanaged positions** —
+the largest operational risk in the Alpaca build. And the bot backfills a year of
+`OPTION_IMPLIED_VOLATILITY` into the IV store on its first cycle, so IV Rank
+becomes the true trailing-range statistic instead of the realised-vol proxy. The
+time exit stays with the bot either way: no exchange order can express "close at
+21 DTE".
+
+**1. Alpaca was the original substitution for IBKR.** IBKR's API requires a running TWS or IB Gateway
 process (via IBC) alongside the app. No free Streamlit or Hugging Face host will
 do that — the container has no desktop session and is recycled on idle. Alpaca is
 pure REST with an options-enabled paper account, so the whole system deploys free.

@@ -96,6 +96,22 @@ DEFAULT_UNIVERSE = ["SPY", "QQQ", "IWM", "DIA", "XLF", "EEM", "GLD", "TLT"]
 class Settings:
     """Immutable snapshot of every runtime parameter."""
 
+    # ---------------------------------------------------------------- venue
+    #: "alpaca" (REST, free, no gateway) or "ibkr" (needs TWS/IB Gateway, but
+    #: brings resting brackets on option legs and real historical IV).
+    broker: str = field(default_factory=lambda: str(setting("BVC_BROKER", "alpaca")).lower())
+
+    # ---------------------------------------------------------------- IBKR
+    ibkr_host: str = field(default_factory=lambda: str(setting("IBKR_HOST", "127.0.0.1")))
+    #: 7497 paper TWS · 7496 live TWS · 4002 paper Gateway · 4001 live Gateway.
+    ibkr_port: int = field(default_factory=lambda: _int("IBKR_PORT", 7497))
+    ibkr_client_id: int = field(default_factory=lambda: _int("IBKR_CLIENT_ID", 17))
+    ibkr_account: str = field(default_factory=lambda: str(setting("IBKR_ACCOUNT", "")))
+    ibkr_readonly: bool = field(default_factory=lambda: _bool("IBKR_READONLY", False))
+    ibkr_timeout: float = field(default_factory=lambda: _float("IBKR_TIMEOUT", 15.0))
+    #: Seed IV Rank from the broker's own implied-vol history when it has one.
+    use_broker_iv_history: bool = field(default_factory=lambda: _bool("BVC_USE_BROKER_IV", True))
+
     # ---------------------------------------------------------------- credentials
     alpaca_api_key: str = field(default_factory=lambda: str(setting("ALPACA_API_KEY", "")))
     alpaca_secret_key: str = field(default_factory=lambda: str(setting("ALPACA_SECRET_KEY", "")))
@@ -177,7 +193,14 @@ class Settings:
 
     # ---------------------------------------------------------------- derived helpers
     @property
+    def uses_ibkr(self) -> bool:
+        return self.broker in {"ibkr", "ib", "interactive_brokers"}
+
+    @property
     def credentials_present(self) -> bool:
+        """IBKR authenticates at the gateway, so there are no keys to check."""
+        if self.uses_ibkr:
+            return True
         return bool(self.alpaca_api_key and self.alpaca_secret_key)
 
     @property

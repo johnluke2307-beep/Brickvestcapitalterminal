@@ -725,6 +725,110 @@ def test_plateau_score_flags_a_manufactured_spike() -> None:
 
 
 # ======================================================================================
+# IBKR connector
+# ======================================================================================
+def test_occ_symbol_survives_the_ibkr_round_trip() -> None:
+    """The platform speaks OCC; IBKR speaks contracts. Translation must be lossless.
+
+    This is what makes the connector a drop-in: positions, the trade log and the
+    UI keep working because symbols come back exactly as they went in.
+    """
+    import ibkr_client as ib
+
+    for underlying, expiry, right, strike in (
+        ("SPY", date(2025, 12, 19), "P", 600.0),
+        ("QQQ", date(2026, 1, 16), "C", 512.5),
+        ("IWM", date(2026, 3, 20), "PUT", 219.0),
+    ):
+        occ = ib.parts_to_occ(underlying, expiry, right, strike)
+        parts = ib.occ_to_parts(occ)
+        assert parts["underlying"] == underlying
+        assert parts["expiration"] == expiry
+        assert approx(parts["strike"], strike, 1e-9)
+        assert parts["option_type"] == ("call" if right.upper().startswith("C") else "put")
+
+
+def test_ibkr_rejects_non_option_symbols() -> None:
+    import ibkr_client as ib
+    from broker_client import BrokerError
+
+    for bad in ("SPY", "", "NOTASYMBOL"):
+        try:
+            ib.occ_to_parts(bad)
+        except BrokerError:
+            continue
+        raise AssertionError(f"{bad!r} should not parse as an option")
+
+
+def test_ibkr_clean_rejects_ib_sentinels() -> None:
+    """IBKR sends NaN and -1 for 'no data'; neither may become a price."""
+    import ibkr_client as ib
+
+    assert ib._clean(float("nan")) is None
+    assert ib._clean(-1) is None
+    assert ib._clean(None) is None
+    assert ib._clean(0) is None
+    assert ib._clean(2.5) == 2.5
+
+
+def test_capabilities_differ_between_venues() -> None:
+    """The bot branches on these, so they must not silently agree."""
+    from broker_client import BrokerClient
+    from ibkr_client import IBKRClient
+
+    assert BrokerClient.capabilities.native_brackets is False
+    assert BrokerClient.capabilities.historical_iv is False
+    assert IBKRClient.capabilities.native_brackets is True
+    assert IBKRClient.capabilities.historical_iv is True
+    assert IBKRClient.capabilities.requires_gateway is True
+
+
+def test_broker_factory_dispatches_on_config() -> None:
+    """BVC_BROKER selects the venue, and a missing gateway is reported not raised."""
+    import config as cfgmod
+    from broker_client import build_client
+
+    settings = cfgmod.load_settings()
+    settings.broker = "ibkr"
+    client = build_client(settings)          # no TWS here — must fail soft
+    assert client.capabilities.name in {"ibkr", "alpaca"}
+    assert client.health.last_error  # it recorded why, rather than throwing
+
+    settings.broker = "alpaca"
+    assert build_client(settings).capabilities.name == "alpaca"
+
+
+def test_broker_iv_backfill_replaces_the_proxy() -> None:
+    """A year of real IV turns IV Rank from a proxy into the true statistic."""
+    store = engine.IVHistoryStore(Path(os.environ["BVC_STATE_DIR"]) / "iv_backfill.csv")
+
+    proxy = store.rank("BFILL", 0.20, [0.10 + 0.002 * i for i in range(40)])
+    assert proxy.is_proxy
+
+    for i in range(260):
+        store.record_on("BFILL", date(2025, 1, 1) + timedelta(days=i), 0.12 + 0.0004 * i)
+
+    real = store.rank("BFILL", 0.20)
+    assert real.source == "iv_history"
+    assert not real.is_proxy
+    assert real.samples >= 200
+    assert 0.0 <= real.value <= 100.0
+
+
+def test_iv_backfill_never_overwrites_an_existing_observation() -> None:
+    """Backfill fills gaps; it must not rewrite history already recorded."""
+    path = Path(os.environ["BVC_STATE_DIR"]) / "iv_nooverwrite.csv"
+    path.unlink(missing_ok=True)
+    store = engine.IVHistoryStore(path)
+
+    store.record_on("KEEP", date(2025, 6, 2), 0.15)
+    store.record_on("KEEP", date(2025, 6, 2), 0.99)
+    rows = store.records("KEEP")
+    assert len(rows) == 1
+    assert approx(float(rows[0]["iv"]), 0.15, 1e-9)
+
+
+# ======================================================================================
 # Runner
 # ======================================================================================
 def main() -> int:

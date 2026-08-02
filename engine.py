@@ -281,6 +281,33 @@ class IVHistoryStore:
                 writer.writeheader()
                 writer.writerows(rows)
 
+    def record_on(self, symbol: str, day, iv: float) -> None:
+        """Store an observation for a *specific* date, for broker backfill.
+
+        :meth:`record` always writes today. A venue that carries historical
+        implied volatility can hand over a year of it at once, which is what
+        turns IV Rank from a proxy into the real statistic — but only if the
+        rows land on their own dates.
+        """
+        if iv is None or iv <= 0:
+            return
+        if hasattr(day, "date") and not isinstance(day, date):
+            day = day.date()
+        stamp = day.isoformat() if hasattr(day, "isoformat") else str(day)[:10]
+
+        with self._lock:
+            rows = self._read_rows()
+            key = (symbol.upper(), stamp)
+            if any((r["symbol"], r["date"]) == key for r in rows):
+                return  # never overwrite an existing observation on backfill
+            rows.append({"date": stamp, "symbol": symbol.upper(), "iv": f"{iv:.6f}",
+                         "spot": "", "rv": ""})
+            rows.sort(key=lambda r: (r["date"], r["symbol"]))
+            with self.path.open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["date", "symbol", "iv", "spot", "rv"])
+                writer.writeheader()
+                writer.writerows(rows)
+
     # ------------------------------------------------------------------- reads
     def _read_rows(self) -> List[dict]:
         if not self.path.exists():

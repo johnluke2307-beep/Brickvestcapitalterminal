@@ -94,6 +94,25 @@ class ConnectionHealth:
 # Value objects
 # ======================================================================================
 @dataclass
+class BrokerCapabilities:
+    """What a given broker can actually do.
+
+    The bot adapts rather than assuming. Alpaca cannot rest a bracket on an
+    option leg, so the 50%/200% pair is enforced by the loop; IBKR can, so the
+    exits sit at the exchange and survive the bot being stopped. That difference
+    is the single biggest operational gap between the two, and it must be visible
+    in code rather than buried in a comment.
+    """
+
+    name: str = "generic"
+    native_brackets: bool = False        # resting OCO/bracket on option legs
+    historical_iv: bool = False          # real implied-vol history, not a proxy
+    multi_leg_orders: bool = True
+    paper: bool = True
+    requires_gateway: bool = False       # needs TWS/IB Gateway running locally
+
+
+@dataclass
 class AccountSnapshot:
     """Normalised account state with the margin guardrail pre-computed."""
 
@@ -233,8 +252,15 @@ def parse_occ_symbol(symbol: str) -> Optional[dict]:
 class BrokerClient:
     """Thread-safe Alpaca trading + market-data client with health tracking."""
 
+    #: Alpaca: no resting brackets on options, no historical IV.
+    capabilities = BrokerCapabilities(
+        name="alpaca", native_brackets=False, historical_iv=False,
+        multi_leg_orders=True, requires_gateway=False,
+    )
+
     def __init__(self, settings: Optional[config.Settings] = None) -> None:
         self.settings = settings or config.load_settings()
+        self.capabilities = BrokerCapabilities(**{**self.capabilities.__dict__, "paper": self.settings.paper})
         self.health = ConnectionHealth()
         self._lock = threading.RLock()
         self._trading = None
@@ -755,7 +781,28 @@ def _order_to_dict(order) -> dict:
 
 
 def build_client(settings: Optional[config.Settings] = None) -> BrokerClient:
-    """Construct and connect a client. Never raises — inspect ``.health``."""
-    client = BrokerClient(settings)
+    """Construct and connect the configured broker. Never raises — inspect ``.health``.
+
+    ``BVC_BROKER`` selects the venue. IBKR is imported lazily so a deployment
+    that only uses Alpaca never needs ib_async installed, and vice versa.
+    """
+    settings = settings or config.load_settings()
+    broker = (settings.broker or "alpaca").lower()
+
+    if broker in {"ibkr", "ib", "interactive_brokers"}:
+        try:
+            from ibkr_client import IBKRClient
+
+            client: BrokerClient = IBKRClient(settings)
+        except ImportError as exc:
+            client = BrokerClient(settings)
+            client.health.record_failure(
+                f"BVC_BROKER=ibkr but ib_async is not installed ({exc}). "
+                "pip install ib_async, or set BVC_BROKER=alpaca."
+            )
+            return client
+    else:
+        client = BrokerClient(settings)
+
     client.connect()
     return client
