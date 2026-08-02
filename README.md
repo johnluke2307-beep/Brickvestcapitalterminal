@@ -104,7 +104,7 @@ profit when   pnl >=  profit_target_pct × |net premium|
 stop   when   pnl <= −stop_loss_multiple × |net premium|
 ```
 
-For a short put that is exactly "close at 50% of the credit, stop at 200%". For
+For a short put that is exactly "close at 50% of the credit, stop at 100%". For
 a calendar it reads "take half the debit as profit, stop at twice it". One rule,
 so a comparison between two strategies is a comparison of the strategies rather
 than of two different exit regimes.
@@ -125,7 +125,7 @@ preflight ─┬─ broker reachable?       ── no ──► HALT
            ├─ account unblocked?      ── no ──► HALT
            ├─ data feed healthy?      ── no ──► HALT
            └─ margin < 50% of equity? ── no ──► no new entries (existing risk still managed)
-manage    ─── every short position: 50% profit target · 200% stop · 21 DTE time exit
+manage    ─── every open structure: 50% profit target · 100% stop · 21 DTE time exit
 scan      ─── universe → IV, RV, VRP, IV Rank
 enter     ─── best qualifying candidate, subject to every guardrail
 ```
@@ -382,7 +382,7 @@ this one is also handed the reasons not to act.
 | Max new entries per day | 2 | throttles correlated same-day risk |
 | One position per underlying | on | prevents stacking the same tail |
 | Liquidity filter | credit ≥ $0.35, spread ≤ 20% of mid | slippage is the tax on a small edge |
-| Stop loss | 200% of credit | i.e. buy back at 3× credit; sent as a marketable close so it actually gets out |
+| Stop loss | 100% of premium at risk | breakeven 67%, vs 80% for the traditional 200% pair. Skipped when the structure's own wing already caps the loss tighter |
 | Time exit | 21 DTE | gamma risk rises faster than remaining theta |
 | Fail-safe | any broker or data failure | halts the bot, persists the reason, flags the UI red; only a human clears it |
 

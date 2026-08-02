@@ -3,7 +3,7 @@ Brickvestcapitalterminal — historical backtester.
 
 Replays the terminal's own mechanical rules over history: sell at the target
 DTE and delta when volatility is rich, take profit at 50% of the credit, stop at
-200%, and close anything still open inside the time exit. It reuses
+100%, and close anything still open inside the time exit. It reuses
 ``engine.py`` for pricing, volatility and expectancy, so a backtest and a live
 cycle are scored by the same code rather than two implementations that drift.
 
@@ -96,7 +96,11 @@ class BacktestConfig:
     short_delta: float = 0.30
     long_delta: float = 0.10
     profit_target: float = 0.50
-    stop_loss: float = 2.00  # loss as a multiple of the credit
+    stop_loss: float = 1.00  # loss as a multiple of the credit
+    #: Whether the hard stop fires at all, mirroring ``Settings.hard_stop_mode``.
+    #: "auto" = undefined-risk structures only, because a defined-risk trade has
+    #: already bought its tail. See the breakeven identity in ``metrics``.
+    hard_stop_mode: str = "auto"
 
     vol_window: int = 30
     vol_lookback: int = 252
@@ -107,6 +111,9 @@ class BacktestConfig:
     vrp_points: float = 0.03
     #: Round strikes to this increment (SPY/QQQ trade $1 wide).
     strike_increment: float = 1.0
+    #: Ceiling on wing width in strike dollars after the delta selection.
+    #: 0 = uncapped, matching ``Settings.max_spread_width``.
+    max_spread_width: float = 0.0
     #: One open position per underlying at a time, as the live bot enforces.
     one_position_per_underlying: bool = True
     #: Intraday entry window, in minutes after the opening bell. Carried so the
@@ -128,6 +135,9 @@ class BacktestConfig:
             short_delta=abs(s.target_delta),
             profit_target=s.profit_target_pct,
             stop_loss=s.stop_loss_multiple,
+            hard_stop_mode=s.hard_stop_mode,
+            long_delta=abs(s.wing_delta),
+            max_spread_width=s.max_spread_width,
             vol_rank_threshold=s.min_iv_rank,
             risk_free_rate=s.risk_free_rate,
             max_margin_utilization=s.max_margin_utilization,
@@ -316,6 +326,46 @@ class Backtester:
         self.rejections: Dict[tuple, tuple] = {}
 
     # ------------------------------------------------------------------ helpers
+    def _hard_stop_applies(self, max_loss: float = 0.0, credit: float = 0.0) -> bool:
+        """Mirror of ``TradingBot._hard_stop_applies`` — same rule, same reason.
+
+        Under "auto" the stop is skipped only when the wing already caps the
+        loss at or inside where the stop would fire. If these two ever disagree
+        the backtest stops being a test of the live strategy, which is the
+        specific failure this whole pass was fixing.
+        """
+        mode = str(self.cfg.hard_stop_mode).lower()
+        try:
+            defined_risk = strategies.get(_canonical_strategy(self.cfg.strategy)).defined_risk
+        except KeyError:
+            defined_risk = False
+        if not defined_risk:
+            return True
+        if mode == "always":
+            return True
+        if mode == "never":
+            return False
+        if max_loss <= 0 or credit <= 0:
+            return True
+        return max_loss > self.cfg.stop_loss * credit
+
+    def _wing(self, spot: float, t: float, iv: float, short_strike: float, is_call: bool) -> float:
+        """The long wing strike: chosen by delta, then pulled inside the cap."""
+        cfg = self.cfg
+        delta = cfg.long_delta if is_call else -cfg.long_delta
+        strike = self._round_strike(
+            engine.strike_from_delta(spot, t, iv, cfg.risk_free_rate, delta, is_call=is_call)
+        )
+        if is_call:
+            strike = max(strike, short_strike + cfg.strike_increment)
+            if cfg.max_spread_width > 0:
+                strike = min(strike, short_strike + cfg.max_spread_width)
+        else:
+            strike = min(strike, short_strike - cfg.strike_increment)
+            if cfg.max_spread_width > 0:
+                strike = max(strike, short_strike - cfg.max_spread_width)
+        return self._round_strike(strike)
+
     def _reject(self, symbol: str, code: str, message: str) -> None:
         """Tally why an entry was skipped, so an empty run can explain itself.
 
@@ -383,7 +433,7 @@ class Backtester:
         # ---- verticals ------------------------------------------------------
         if strategy == "put_credit_spread":
             short_put = put_at(cfg.short_delta)
-            long_put = min(put_at(cfg.long_delta), short_put - cfg.strike_increment)
+            long_put = self._wing(spot, t, iv, short_put, is_call=False)
             if short_put >= spot or long_put <= 0:
                 return None
             return (
@@ -393,7 +443,7 @@ class Backtester:
 
         if strategy == "call_credit_spread":
             short_call = call_at(cfg.short_delta)
-            long_call = max(call_at(cfg.long_delta), short_call + cfg.strike_increment)
+            long_call = self._wing(spot, t, iv, short_call, is_call=True)
             if short_call <= spot:
                 return None
             return (
@@ -404,7 +454,7 @@ class Backtester:
         # ---- four-leg -------------------------------------------------------
         if strategy == "iron_butterfly":
             body = self._round_strike(spot)
-            wing = max(cfg.strike_increment, body - put_at(cfg.long_delta))
+            wing = max(cfg.strike_increment, body - self._wing(spot, t, iv, body, is_call=False))
             legs = [
                 Leg(body, False, -1), Leg(body - wing, False, 1),
                 Leg(body, True, -1), Leg(body + wing, True, 1),
@@ -413,9 +463,9 @@ class Backtester:
 
         if strategy == "iron_condor":
             short_put = put_at(cfg.short_delta)
-            long_put = min(put_at(cfg.long_delta), short_put - cfg.strike_increment)
+            long_put = self._wing(spot, t, iv, short_put, is_call=False)
             short_call = max(call_at(cfg.short_delta), spot + cfg.strike_increment)
-            long_call = max(call_at(cfg.long_delta), short_call + cfg.strike_increment)
+            long_call = self._wing(spot, t, iv, short_call, is_call=True)
             if short_put >= spot or long_put <= 0:
                 return None
             legs = [
@@ -491,7 +541,11 @@ class Backtester:
             # relabelled by the calendar.
             if credit > 0 and debit <= credit * (1 - cfg.profit_target):
                 reason = "profit_target"
-            elif credit > 0 and debit >= credit * (1 + cfg.stop_loss):
+            elif (
+                credit > 0
+                and self._hard_stop_applies(max_loss=pos.collateral - credit, credit=credit)
+                and debit >= credit * (1 + cfg.stop_loss)
+            ):
                 reason = "stop_loss"
             elif days_left <= 0:
                 reason = "expired"

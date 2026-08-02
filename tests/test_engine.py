@@ -463,17 +463,29 @@ def test_more_assumed_premium_produces_more_profit() -> None:
 
     If a bigger modelled premium did not pay better on identical price paths, the
     pricing surface and the P&L accounting would be inconsistent.
+
+    Three symbols over four years on purpose. The same check on one symbol over
+    two years runs about 30 trades, and at that sample a 3-point difference in
+    assumed premium is indistinguishable from path luck — the invariant is real
+    but unmeasurable, and a test that cannot measure its own claim is a test
+    that fails at random. It is the platform's own lesson applied to itself.
     """
     import backtest as bt
 
-    prices = {"SPY": _synthetic_frame(seed=7)}
+    prices = {
+        "SPY": _synthetic_frame(seed=7),
+        "QQQ": _synthetic_frame(seed=8, s0=200.0),
+        "IWM": _synthetic_frame(seed=9, s0=160.0),
+    }
     returns = []
     for vrp in (0.0, 0.03, 0.06):
         cfg = bt.BacktestConfig(
-            symbols=["SPY"], start_date="2020-01-01", end_date="2022-01-01",
+            symbols=list(prices), start_date="2020-01-01", end_date="2024-01-01",
             strategy="put_credit_spread", vrp_points=vrp,
         )
-        returns.append(bt.Backtester(cfg, prices).run().metrics["total_return"])
+        result = bt.Backtester(cfg, prices).run()
+        assert result.metrics["trades"] > 80, f"sample too small to measure: {result.metrics['trades']}"
+        returns.append(result.metrics["total_return"])
     assert returns[0] < returns[1] < returns[2], returns
 
 
@@ -1240,8 +1252,12 @@ def _chain(spot: float = 100.0, expiry_days: int = 45, vol: float = 0.22):
     expiration = date.today() + timedelta(days=expiry_days)
     t = engine.year_fraction(expiration)
     quotes = []
-    for strike in [spot * (1 + i * 0.025) for i in range(-14, 9)]:
-        strike = round(strike, 0)
+    # Strikes step by ~1% of spot, which is roughly how real ETF chains are
+    # listed. A coarse ladder would let a selector miss its delta target by a
+    # wide margin and still look correct.
+    step = max(round(spot * 0.01), 1)
+    for strike in range(int(spot * 0.70), int(spot * 1.16), step):
+        strike = float(strike)
         for right in ("put", "call"):
             is_call = right == "call"
             price = engine.bs_price(spot, strike, t, vol, 0.043, is_call)
@@ -1401,6 +1417,7 @@ def test_the_exit_rule_means_the_same_thing_for_credit_and_debit() -> None:
     settings.profit_target_pct = 0.50
     settings.stop_loss_multiple = 2.0
     settings.time_exit_dte = 0
+    settings.strategy = "cash_secured_put"   # undefined risk, so the stop applies
 
     def position(symbol: str, qty: float, price: float) -> PositionView:
         return PositionView(
@@ -1487,6 +1504,193 @@ def test_switching_strategy_is_not_something_the_agent_can_do() -> None:
     settings.apply_overlay(store)
     assert settings.strategy == before
     assert "strategy" in settings.overlay_rejected
+
+
+# ======================================================================================
+# Wing selection, the hard stop, and the breakeven identity
+# ======================================================================================
+def test_wings_are_chosen_by_delta_so_they_scale_with_the_underlying() -> None:
+    """A fixed dollar wing is a different trade on every symbol.
+
+    The same delta settings on a $90 name and a $600 name must produce wings
+    that are comparable in *risk*, not in dollars. Checked by comparing the
+    width as a fraction of spot, which is what should stay roughly constant.
+    """
+    import strategies as lib
+
+    widths = {}
+    for spot in (90.0, 300.0, 600.0):
+        ctx = _ctx("put_credit_spread", wing_delta=0.10, max_spread_width=0.0)
+        ctx.spot = spot
+        ctx.near = _chain(spot=spot)
+        plan = lib.build_plan("put_credit_spread", ctx)
+        assert plan is not None, f"no plan at spot {spot}"
+        short, long = plan.legs
+        widths[spot] = abs(short.quote.strike - long.quote.strike) / spot
+
+    # Delta selection keeps the *relative* wing stable across a 6.7x price range.
+    assert max(widths.values()) / min(widths.values()) < 1.5, widths
+
+
+def test_max_spread_width_caps_the_wing_without_becoming_the_target() -> None:
+    """The cap bounds margin per trade; it must not silently drive selection."""
+    import strategies as lib
+
+    uncapped = lib.build_plan("put_credit_spread", _ctx("put_credit_spread", wing_delta=0.05))
+    capped = lib.build_plan(
+        "put_credit_spread", _ctx("put_credit_spread", wing_delta=0.05, max_spread_width=5.0)
+    )
+    u_width = abs(uncapped.legs[0].quote.strike - uncapped.legs[1].quote.strike)
+    c_width = abs(capped.legs[0].quote.strike - capped.legs[1].quote.strike)
+    assert u_width > 5.0, "test needs an uncapped wing wider than the cap"
+    assert c_width <= 5.0
+    assert capped.capital_required < uncapped.capital_required
+
+
+def test_the_backtester_builds_the_same_spread_the_live_bot_would() -> None:
+    """The defect this pass fixed: live picked wings by dollars, the replay by delta.
+
+    Compared as a fraction of spot, because the replay solves for an exact
+    strike on a modelled surface while the library picks a listed one.
+    """
+    import backtest as bt
+    import strategies as lib
+
+    spot, iv = 300.0, 0.22
+    ctx = _ctx("put_credit_spread", wing_delta=0.10)
+    ctx.spot, ctx.near = spot, _chain(spot=spot, vol=iv)
+    settings = ctx.settings
+
+    plan = lib.build_plan("put_credit_spread", ctx)
+    live_width = abs(plan.legs[0].quote.strike - plan.legs[1].quote.strike)
+
+    cfg = bt.BacktestConfig.from_settings(settings)
+    tester = bt.Backtester(cfg, {})
+    t = engine.year_fraction(date.today() + timedelta(days=45))
+    legs, _ = tester._build_legs(spot, t, iv)
+    replay_width = abs(legs[0].strike - legs[1].strike)
+
+    assert cfg.long_delta == settings.wing_delta
+    assert abs(live_width - replay_width) / spot < 0.02, (live_width, replay_width)
+
+
+def test_defined_risk_trades_do_not_fire_a_hard_stop_under_auto() -> None:
+    """You bought the wing. Declining to use it is paying twice for one tail."""
+    from broker_client import PositionView
+
+    bot, _, settings = _hermes_pair("hardstop")
+    settings.profit_target_pct = 0.50
+    settings.stop_loss_multiple = 1.0
+    settings.time_exit_dte = 0
+    settings.hard_stop_mode = "auto"
+
+    def leg(symbol: str, qty: float, price: float) -> PositionView:
+        return PositionView(
+            symbol=symbol, qty=qty, avg_entry_price=price, current_price=price,
+            market_value=0.0, cost_basis=0.0, unrealized_pl=0.0, unrealized_plpc=0.0,
+            asset_class="us_option", option_type="put",
+            expiration=date.today() + timedelta(days=40),
+        )
+
+    legs = [{"symbol": "SHORT", "action": "sell", "ratio": 1},
+            {"symbol": "LONG", "action": "buy", "ratio": 1}]
+    # Sold for 1.00, now costs 3.00 to close — a 200% loss.
+    positions = {"SHORT": leg("SHORT", -1, 3.50), "LONG": leg("LONG", 1, 0.50)}
+
+    # A narrow wing: max loss $80 is already inside the $100 stop, so the stop
+    # is unreachable and "auto" correctly declines to arm it.
+    narrow = {"credit": "1.00", "contracts": "1", "status": "open", "max_loss": "80",
+              "strategy": "put_credit_spread", "legs": json.dumps(legs)}
+    assert bot._hard_stop_applies(narrow) is False
+
+    # A distant wing: max loss $400 is four times the stop level, so the wing is
+    # no substitute for it. This is the case the replay actually measured.
+    spread = {"credit": "1.00", "contracts": "1", "status": "open", "max_loss": "400",
+              "strategy": "put_credit_spread", "legs": json.dumps(legs)}
+    assert bot._hard_stop_applies(spread) is True
+    assert bot._trade_exit_decision(spread, positions)[0] == "stop_loss"
+
+    # The same loss on an undefined-risk short stops, and "never" cannot turn
+    # that off — the stop is the only thing between it and the tail.
+    naked = {"credit": "1.00", "contracts": "1", "status": "open",
+             "strategy": "cash_secured_put",
+             "legs": json.dumps([{"symbol": "SHORT", "action": "sell", "ratio": 1}])}
+    assert bot._hard_stop_applies(naked) is True
+    assert bot._trade_exit_decision(naked, positions)[0] == "stop_loss"
+    settings.hard_stop_mode = "never"
+    assert bot._hard_stop_applies(naked) is True
+
+    settings.hard_stop_mode = "always"
+    assert bot._hard_stop_applies(narrow) is True     # override reaches even a moot stop
+    settings.hard_stop_mode = "never"
+    assert bot._hard_stop_applies(spread) is False    # ...and can disarm a live one
+
+
+def test_backtest_and_bot_agree_on_when_a_stop_fires() -> None:
+    """Two implementations of one rule is how a backtest stops being a test."""
+    import backtest as bt
+
+    # (strategy, mode, max_loss $, credit $, expected)
+    cases = [
+        ("put_credit_spread", "auto",   400.0, 100.0, True),   # distant wing → stop arms
+        ("put_credit_spread", "auto",    80.0, 100.0, False),  # narrow wing → stop is moot
+        ("put_credit_spread", "always",  80.0, 100.0, True),
+        ("put_credit_spread", "never",  400.0, 100.0, False),
+        ("cash_secured_put",  "auto",     0.0, 100.0, True),
+        ("cash_secured_put",  "never",    0.0, 100.0, True),   # naked shorts always stop
+        ("iron_condor",       "auto",   350.0, 100.0, True),
+    ]
+    for strategy, mode, max_loss, credit, expected in cases:
+        bot, _, settings = _hermes_pair(f"agree_{strategy}_{mode}_{max_loss:.0f}")
+        settings.strategy, settings.hard_stop_mode = strategy, mode
+        settings.stop_loss_multiple = 1.0
+        cfg = bt.BacktestConfig(strategy=strategy, hard_stop_mode=mode, stop_loss=1.0)
+
+        live = bot._hard_stop_applies({
+            "strategy": strategy, "max_loss": str(max_loss),
+            "credit": str(credit / 100.0), "contracts": "1",
+        })
+        replay = bt.Backtester(cfg, {})._hard_stop_applies(max_loss=max_loss, credit=credit)
+        assert live == replay == expected, (strategy, mode, max_loss, live, replay)
+
+
+def test_the_default_bracket_starts_above_the_risk_neutral_win_rate() -> None:
+    """The reason the default stop moved from 200% to 100%.
+
+    A 50%/200% bracket needs an 80% win rate to break even, while a 30-delta
+    short is only ~70% out of the money on risk-neutral probabilities — it
+    starts *below* breakeven and depends entirely on the variance risk premium
+    to climb above it. 50%/100% needs 67%, which starts above it.
+    """
+    import config as cfgmod
+
+    settings = cfgmod.Settings()
+    breakeven = engine.breakeven_win_rate(settings.profit_target_pct, settings.stop_loss_multiple)
+    assert approx(breakeven, 2.0 / 3.0, 1e-9)
+
+    # The delta-implied probability of the short expiring worthless.
+    t = engine.year_fraction(date.today() + timedelta(days=45))
+    delta = engine.bs_delta(100.0, engine.strike_from_delta(100.0, t, 0.20, 0.043, -0.30, False),
+                            t, 0.20, 0.043, is_call=False)
+    risk_neutral_win = 1.0 - abs(delta)
+    assert risk_neutral_win > breakeven, (risk_neutral_win, breakeven)
+    assert engine.breakeven_win_rate(0.50, 2.00) > risk_neutral_win  # the old default did not
+
+
+def test_the_default_strategy_is_the_one_that_fits_the_capital() -> None:
+    """A cash-secured put ties up strike notional to earn under 1% of it."""
+    import config as cfgmod
+    import strategies as lib
+
+    settings = cfgmod.Settings()
+    assert settings.strategy == "put_credit_spread"
+    assert lib.get(settings.strategy).defined_risk
+
+    csp = lib.build_plan("cash_secured_put", _ctx("cash_secured_put"))
+    spread = lib.build_plan("put_credit_spread", _ctx("put_credit_spread"))
+    # Same view, same short strike, a fraction of the capital.
+    assert spread.capital_required < csp.capital_required / 5
+    assert spread.net_premium / spread.capital_required > csp.net_premium / csp.capital_required
 
 
 # ======================================================================================

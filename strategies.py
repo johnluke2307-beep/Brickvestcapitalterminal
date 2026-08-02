@@ -28,9 +28,13 @@ fraction of the premium at risk:
     profit when   pnl >= profit_target_pct × |net premium|
     stop when     pnl <= −stop_loss_multiple × |net premium|
 
-For a short put that is exactly the classic "close at 50% of the credit, stop at
-200%". For a calendar it means "take half the debit as profit, stop at twice
-it". One rule, and the comparison between strategies stays honest.
+For a short put that is exactly "close at 50% of the credit, stop at 100%". For
+a calendar it means "take half the debit as profit, stop at the whole debit".
+One rule, and the comparison between strategies stays honest.
+
+Whether the stop arms at all is decided in the execution layer: a stop the
+structure's own wing has already made unreachable is dead code, so it is not
+armed. See ``TradingBot._hard_stop_applies``.
 
 What the numbers are not
 ------------------------
@@ -268,6 +272,52 @@ def build_covered_call(ctx: BuildContext) -> Optional[StrategyPlan]:
     )
 
 
+def select_wing(
+    chain: Sequence["OptionQuote"],
+    right: str,
+    short: "OptionQuote",
+    settings: config.Settings,
+) -> Optional["OptionQuote"]:
+    """The long wing for a vertical, condor or butterfly — chosen by **delta**.
+
+    A wing picked at a fixed dollar distance is a different trade on every
+    underlying: $5 is one strike on SPY and a fifth of the distance to zero on a
+    $25 name. Delta scales with both price and volatility, which is what makes a
+    5-symbol universe comparable and what makes the backtest replay the same
+    structure the live bot sends.
+
+    ``max_spread_width`` then pulls the wing back in if the delta choice would
+    tie up more margin than the operator wants per trade. It is a ceiling on
+    width, never a target — when it is zero the delta choice stands.
+    """
+    below = right == "put"
+    candidates = [
+        q for q in _side(chain, right)
+        if (q.strike < short.strike if below else q.strike > short.strike)
+    ]
+    if not candidates:
+        return None
+
+    wing = by_delta(candidates, right, settings.wing_delta, tolerance=1.0)
+    if wing is None:
+        # No greeks on this side of the chain: fall back to the furthest strike
+        # inside the width cap rather than silently selling a naked leg.
+        wing = min(candidates, key=lambda q: abs(q.strike - short.strike))
+
+    cap = settings.max_spread_width
+    if cap > 0 and abs(wing.strike - short.strike) > cap:
+        # The widest listed strike that still *fits* under the cap — not the one
+        # nearest to it, which can land on the far side and quietly exceed a
+        # limit whose entire job is to bound margin per trade.
+        fits = [q for q in candidates if abs(q.strike - short.strike) <= cap]
+        wing = (
+            max(fits, key=lambda q: abs(q.strike - short.strike))
+            if fits
+            else min(candidates, key=lambda q: abs(q.strike - short.strike))
+        )
+    return wing if wing.strike != short.strike else None
+
+
 def _vertical(
     ctx: BuildContext, right: str, key: str, *, wing_below: bool
 ) -> Optional[StrategyPlan]:
@@ -276,9 +326,8 @@ def _vertical(
     short = by_delta(ctx.near, right, s.target_delta, s.delta_tolerance)
     if short is None:
         return None
-    target = short.strike - s.spread_width if wing_below else short.strike + s.spread_width
-    long = at_strike(ctx.near, right, target)
-    if long is None or long.strike == short.strike:
+    long = select_wing(ctx.near, right, short, s)
+    if long is None:
         return None
 
     width = abs(short.strike - long.strike)
@@ -317,11 +366,9 @@ def build_iron_condor(ctx: BuildContext) -> Optional[StrategyPlan]:
     short_call = by_delta(ctx.near, "call", s.target_delta, s.delta_tolerance)
     if short_put is None or short_call is None:
         return None
-    long_put = at_strike(ctx.near, "put", short_put.strike - s.spread_width)
-    long_call = at_strike(ctx.near, "call", short_call.strike + s.spread_width)
+    long_put = select_wing(ctx.near, "put", short_put, s)
+    long_call = select_wing(ctx.near, "call", short_call, s)
     if long_put is None or long_call is None:
-        return None
-    if long_put.strike >= short_put.strike or long_call.strike <= short_call.strike:
         return None
 
     put_width = short_put.strike - long_put.strike
@@ -359,11 +406,9 @@ def build_iron_butterfly(ctx: BuildContext) -> Optional[StrategyPlan]:
     body_call = at_strike(ctx.near, "call", body_put.strike) if body_put else None
     if body_put is None or body_call is None:
         return None
-    long_put = at_strike(ctx.near, "put", body_put.strike - s.spread_width)
-    long_call = at_strike(ctx.near, "call", body_call.strike + s.spread_width)
+    long_put = select_wing(ctx.near, "put", body_put, s)
+    long_call = select_wing(ctx.near, "call", body_call, s)
     if long_put is None or long_call is None:
-        return None
-    if long_put.strike >= body_put.strike or long_call.strike <= body_call.strike:
         return None
 
     width = max(body_put.strike - long_put.strike, long_call.strike - body_call.strike)
@@ -500,7 +545,7 @@ REGISTRY: Dict[str, StrategyDefinition] = {
             defined_risk=False,
             leg_count=1,
             options_level=2,
-            defaults={"target_delta": 0.30, "profit_target_pct": 0.50, "stop_loss_multiple": 2.0},
+            defaults={"target_delta": 0.30, "profit_target_pct": 0.50, "stop_loss_multiple": 1.0},
         ),
         StrategyDefinition(
             key="covered_call",
@@ -512,7 +557,7 @@ REGISTRY: Dict[str, StrategyDefinition] = {
             leg_count=1,
             needs_shares=True,
             options_level=1,
-            defaults={"target_delta": 0.30, "profit_target_pct": 0.50, "stop_loss_multiple": 2.0},
+            defaults={"target_delta": 0.30, "profit_target_pct": 0.50, "stop_loss_multiple": 1.0},
         ),
         StrategyDefinition(
             key="put_credit_spread",
@@ -521,7 +566,7 @@ REGISTRY: Dict[str, StrategyDefinition] = {
                    "direction, a fraction of the capital, a bounded worst case.",
             build=build_put_credit_spread,
             leg_count=2,
-            defaults={"target_delta": 0.30, "spread_width": 5.0},
+            defaults={"target_delta": 0.30, "wing_delta": 0.10},
         ),
         StrategyDefinition(
             key="call_credit_spread",
@@ -530,7 +575,7 @@ REGISTRY: Dict[str, StrategyDefinition] = {
                    "the skew makes puts the expensive side to be short.",
             build=build_call_credit_spread,
             leg_count=2,
-            defaults={"target_delta": 0.30, "spread_width": 5.0},
+            defaults={"target_delta": 0.30, "wing_delta": 0.10},
         ),
         StrategyDefinition(
             key="iron_condor",
@@ -539,7 +584,7 @@ REGISTRY: Dict[str, StrategyDefinition] = {
                    "of one vertical for the same margin, with no directional view.",
             build=build_iron_condor,
             leg_count=4,
-            defaults={"target_delta": 0.20, "spread_width": 5.0, "profit_target_pct": 0.50},
+            defaults={"target_delta": 0.20, "wing_delta": 0.08, "profit_target_pct": 0.50},
         ),
         StrategyDefinition(
             key="iron_butterfly",
@@ -549,7 +594,7 @@ REGISTRY: Dict[str, StrategyDefinition] = {
                    "volatility comes in under implied.",
             build=build_iron_butterfly,
             leg_count=4,
-            defaults={"spread_width": 10.0, "profit_target_pct": 0.25},
+            defaults={"wing_delta": 0.15, "profit_target_pct": 0.25},
         ),
         StrategyDefinition(
             key="calendar_spread",

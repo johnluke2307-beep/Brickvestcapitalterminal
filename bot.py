@@ -603,6 +603,52 @@ class TradingBot:
             total += price * int(leg.get("ratio", 1)) * (1 if leg["action"] == "sell" else -1)
         return round(total, 4)
 
+    def _hard_stop_applies(self, record: dict) -> bool:
+        """Whether a stop-loss fires for this trade at all.
+
+        ``auto`` skips the stop only when the structure's own wing already caps
+        the loss at or inside where the stop would trigger. Firing a stop the
+        wing has already made unreachable is dead code; firing one *inside* a
+        distant wing is not, and the replay says so — across eight independent
+        price paths a 100% stop had the better median drawdown in both the
+        assumed-edge and null-hypothesis regimes.
+
+        That is a narrower rule than "defined risk needs no stop". A 30-delta
+        short against a 10-delta wing can still lose two or three times the
+        credit before the wing does anything, so the wing is not a substitute
+        for a stop — it only becomes one when the spread is narrow enough that
+        max loss is already under the stop level.
+
+        On an undefined-risk short the stop is the only thing between you and
+        the tail, so it fires regardless of what anything else says.
+        """
+        mode = str(getattr(self.settings, "hard_stop_mode", "auto")).lower()
+        try:
+            defined_risk = strategies.get(str(record.get("strategy") or self.settings.strategy)).defined_risk
+        except KeyError:
+            defined_risk = False  # unknown structure → treat as naked and protect it
+
+        if not defined_risk:
+            return True           # "never" does not disable a stop on a naked short
+        if mode == "always":
+            return True
+        if mode == "never":
+            return False
+        return not self._wing_already_caps_the_loss(record)
+
+    def _wing_already_caps_the_loss(self, record: dict) -> bool:
+        """True when max loss is at or inside the stop, making the stop moot."""
+        try:
+            max_loss = float(record.get("max_loss") or 0.0)
+            premium = abs(float(record.get("credit") or 0.0))
+            contracts = int(float(record.get("contracts") or 1))
+        except (TypeError, ValueError):
+            return False
+        if max_loss <= 0 or premium <= 0:
+            return False
+        stop_level = self.settings.stop_loss_multiple * premium * OPTION_MULTIPLIER * contracts
+        return max_loss <= stop_level
+
     def _trade_exit_decision(
         self, record: dict, by_symbol: Dict[str, PositionView]
     ) -> Optional[tuple[str, float, float]]:
@@ -637,7 +683,7 @@ class TradingBot:
         if not exchange_held:
             if pnl >= settings.profit_target_pct * at_risk:
                 return ("profit_target", close_cost, pnl)
-            if pnl <= -settings.stop_loss_multiple * at_risk:
+            if self._hard_stop_applies(record) and pnl <= -settings.stop_loss_multiple * at_risk:
                 return ("stop_loss", close_cost, pnl)
 
         dtes = [by_symbol[leg["symbol"]].dte for leg in legs if by_symbol.get(leg["symbol"])]

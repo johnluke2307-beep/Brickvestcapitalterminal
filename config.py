@@ -199,7 +199,8 @@ HERMES_BOUNDS: Dict[str, Bound] = {
     "min_credit_usd": Bound(0.10, 5.00, "higher"),
     "max_spread_pct": Bound(0.02, 0.50, "lower"),
     # ---- multi-leg shape, used only by the strategies that have those legs --
-    "spread_width": Bound(1.0, 50.0, "lower", note="a narrower wing caps the defined loss"),
+    "wing_delta": Bound(0.03, 0.25, "higher", note="a closer wing caps the defined loss"),
+    "max_spread_width": Bound(0.0, 100.0),
     "long_leg_delta": Bound(0.60, 0.95, "higher", note="deeper long leg tracks the stock more closely"),
     "back_month_dte": Bound(60, 240),
 
@@ -378,9 +379,22 @@ class Settings:
     #: geometry, the capital requirement and the options approval level needed;
     #: it is an operator decision. Hermes can recommend a switch in its report,
     #: and can compare strategies in the backtester, but cannot make one.
-    strategy: str = field(default_factory=lambda: str(setting("BVC_STRATEGY", "cash_secured_put")).lower())
-    #: Width in strikes-dollars for the long wing of a spread, condor or fly.
-    spread_width: float = field(default_factory=lambda: _float("BVC_SPREAD_WIDTH", 5.0))
+    #: Defaults to the defined-risk vertical rather than the cash-secured put.
+    #: A CSP ties up the full strike notional to earn under 1% of it per cycle,
+    #: which needs several hundred thousand dollars behind it to produce a
+    #: meaningful income. The spread expresses the same view on the width.
+    strategy: str = field(default_factory=lambda: str(setting("BVC_STRATEGY", "put_credit_spread")).lower())
+    #: Delta of the long wing of a vertical, condor or butterfly.
+    #:
+    #: Selected by **delta, not by dollars**. A fixed $5 wing means something
+    #: completely different on TLT at $90 and SPY at $600, and it made the
+    #: backtester construct a different spread from the live bot — so the
+    #: backtest was not testing the strategy that would actually run.
+    wing_delta: float = field(default_factory=lambda: _float("BVC_WING_DELTA", 0.10))
+    #: Optional ceiling on wing width in strike dollars, applied after the delta
+    #: selection so margin per trade stays bounded on high-priced underlyings.
+    #: ``0`` (the default) leaves the delta choice untouched.
+    max_spread_width: float = field(default_factory=lambda: _float("BVC_MAX_SPREAD_WIDTH", 0.0))
     #: Delta of the long back-month leg in a diagonal (PMCC). Deep enough that
     #: the leg behaves like stock; 0.80 is the usual floor.
     long_leg_delta: float = field(default_factory=lambda: _float("BVC_LONG_LEG_DELTA", 0.80))
@@ -390,8 +404,24 @@ class Settings:
     # ---------------------------------------------------------------- exit management
     #: Buy back at 50% of the credit received — the classic VRP profit taker.
     profit_target_pct: float = field(default_factory=lambda: _float("BVC_PROFIT_TARGET_PCT", 0.50))
-    #: Stop when the open loss reaches 200% of the credit (i.e. price = 3× credit).
-    stop_loss_multiple: float = field(default_factory=lambda: _float("BVC_STOP_LOSS_MULTIPLE", 2.00))
+    #: Stop when the open loss reaches this multiple of the premium at risk.
+    #:
+    #: The breakeven win rate of a ``profit_target/stop`` bracket is
+    #: ``stop / (profit_target + stop)``. The traditional 50%/200% pair needs an
+    #: **80%** win rate to break even, while a 30-delta short is only ~70%
+    #: out-of-the-money on risk-neutral probabilities — so it starts below
+    #: breakeven and depends entirely on the variance risk premium to climb
+    #: above it. 100% needs 67%, which starts above the risk-neutral rate.
+    stop_loss_multiple: float = field(default_factory=lambda: _float("BVC_STOP_LOSS_MULTIPLE", 1.00))
+    #: When a hard stop applies at all.
+    #:
+    #: ``auto`` (default) fires the stop only on undefined-risk strategies. On a
+    #: spread or a condor the tail has *already been bought*: the loss is capped
+    #: at width minus credit, and a stop on top of that mostly converts
+    #: drawdowns that would have recovered into realised losses. ``always`` and
+    #: ``never`` override. Not agent-mutable — this is structural, like the
+    #: choice of strategy.
+    hard_stop_mode: str = field(default_factory=lambda: str(setting("BVC_HARD_STOP", "auto")).lower())
     #: Mechanical time stop: close anything still open inside 21 DTE (gamma risk).
     time_exit_dte: int = field(default_factory=lambda: _int("BVC_TIME_EXIT_DTE", 21))
 
