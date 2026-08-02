@@ -290,27 +290,55 @@ def inject_terminal_css() -> None:
 
 
 def style_figure(fig: go.Figure, height: int = 320, *, showlegend: bool = False) -> go.Figure:
-    """Recessive chrome, transparent surface, one axis, hover always on."""
+    """Terminal chrome for a chart: mono ticks, crosshair, recessive grid.
+
+    The charts previously wore Plotly's default sans at 13px inside a fully
+    monospace deck, which read as a widget dropped into a terminal rather than
+    part of it. Everything here exists to close that gap: the same typeface and
+    tracking as the tables, amber-dim tick labels matching the column heads,
+    hairline dashed gridlines, and a crosshair on hover the way a quote screen
+    behaves.
+    """
     palette = theme()
     fig.update_layout(
         height=height,
-        margin=dict(l=8, r=8, t=28, b=8),
+        margin=dict(l=4, r=4, t=22, b=4),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="system-ui, -apple-system, 'Segoe UI', sans-serif", size=13, color=palette["text"]),
+        font=dict(family=MONO, size=11, color=palette["text"]),
         showlegend=showlegend,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(color=palette["muted"])),
-        hoverlabel=dict(font_size=12),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.0, x=0,
+            font=dict(color=palette["muted"], size=10, family=MONO),
+            bgcolor="rgba(0,0,0,0)",
+        ),
+        hoverlabel=dict(
+            font=dict(family=MONO, size=11, color=palette["text"]),
+            bgcolor=palette["panel"],
+            bordercolor=palette["chrome"],
+        ),
+        hovermode=fig.layout.hovermode or "closest",
+        dragmode=False,
     )
-    fig.update_xaxes(showgrid=False, zeroline=False, linecolor=palette["axis"], tickfont=dict(color=palette["muted"]))
-    fig.update_yaxes(
+    axis = dict(
         showgrid=True,
         gridcolor=palette["grid"],
         gridwidth=1,
+        griddash="dot",
         zeroline=False,
         linecolor=palette["axis"],
-        tickfont=dict(color=palette["muted"]),
+        linewidth=1,
+        tickfont=dict(color=palette["chrome_dim"], size=10, family=MONO),
+        ticklen=3,
+        tickcolor=palette["axis"],
+        showspikes=True,
+        spikecolor=palette["chrome_dim"],
+        spikethickness=1,
+        spikedash="dot",
+        spikemode="across",
     )
+    fig.update_xaxes(**{**axis, "showgrid": False})
+    fig.update_yaxes(**axis)
     return fig
 
 
@@ -746,7 +774,7 @@ def render_monthly_income_chart(zar_by_month: dict, target: float) -> None:
             marker=dict(color=colors, line=dict(width=2, color=palette["surface"])),
             text=[f"R{v:,.0f}" for v in values],
             textposition="outside",
-            textfont=dict(color=palette["muted"], size=11),
+            textfont=dict(color=palette["chrome_dim"], size=10, family=MONO),
             hovertemplate="%{x}<br>R%{y:,.0f}<extra></extra>",
         )
     )
@@ -757,7 +785,7 @@ def render_monthly_income_chart(zar_by_month: dict, target: float) -> None:
         line=dict(color=palette["muted"], width=1, dash="dot"),
         annotation_text=f"Target R{target:,.0f}",
         annotation_position="top left",
-        annotation_font=dict(color=palette["muted"], size=11),
+        annotation_font=dict(color=palette["chrome_dim"], size=10, family=MONO),
     )
     st.plotly_chart(style_figure(fig), use_container_width=True, config={"displayModeBar": False})
 
@@ -783,9 +811,8 @@ def render_cumulative_pnl_chart(closed: List[dict]) -> None:
         go.Scatter(
             x=dates,
             y=cumulative,
-            mode="lines+markers",
-            line=dict(color=palette["series_1"], width=2),
-            marker=dict(size=8, color=palette["series_1"], line=dict(width=2, color=palette["surface"])),
+            mode="lines",
+            line=dict(color=palette["series_1"], width=1.6),
             fill="tozeroy",
             fillcolor=palette["series_1_fill"],
             hovertemplate="%{x}<br>R%{y:,.0f} cumulative<extra></extra>",
@@ -910,7 +937,7 @@ def render_vrp_chart(snapshots: List[engine.VRPSnapshot]) -> None:
             marker=dict(color=colors, line=dict(width=2, color=palette["surface"])),
             text=[f"{v:+.1f}" for v in values],
             textposition="outside",
-            textfont=dict(color=palette["muted"], size=11),
+            textfont=dict(color=palette["chrome_dim"], size=10, family=MONO),
             hovertemplate="%{y}<br>VRP %{x:+.1f} vol points<extra></extra>",
         )
     )
@@ -937,7 +964,7 @@ def render_iv_rv_history(bot: TradingBot, symbol: str) -> None:
             y=ivs,
             name="Implied volatility",
             mode="lines",
-            line=dict(color=palette["series_1"], width=2),
+            line=dict(color=palette["series_1"], width=1.6),
             hovertemplate="IV %{y:.1f}%<extra></extra>",
         )
     )
@@ -958,7 +985,7 @@ def render_iv_rv_history(bot: TradingBot, symbol: str) -> None:
                 y=[v for _, v in rv_points],
                 name="Realised volatility",
                 mode="lines",
-                line=dict(color=palette["series_2"], width=2),
+                line=dict(color=palette["series_2"], width=1.6),
                 hovertemplate="RV %{y:.1f}%<extra></extra>",
             )
         )
@@ -1363,7 +1390,7 @@ def render_strategy_comparison(comparison: dict, bot: TradingBot) -> None:
         fig.add_trace(
             go.Scatter(
                 x=result.nav.index, y=result.nav.values, mode="lines", name=name,
-                line=dict(color=series_colours.get(name, palette["muted"]), width=2),
+                line=dict(color=series_colours.get(name, palette["muted"]), width=1.6),
                 hovertemplate="%{x|%Y-%m-%d}<br>$%{y:,.0f}<extra>" + name + "</extra>",
             )
         )
@@ -1372,7 +1399,7 @@ def render_strategy_comparison(comparison: dict, bot: TradingBot) -> None:
         y=first.config.initial_capital,
         line=dict(color=palette["muted"], width=1, dash="dot"),
         annotation_text="Starting capital", annotation_position="bottom right",
-        annotation_font=dict(color=palette["muted"], size=11),
+        annotation_font=dict(color=palette["chrome_dim"], size=10, family=MONO),
     )
     fig.update_layout(hovermode="x unified")
     st.plotly_chart(style_figure(fig, height=360, showlegend=True),
@@ -1612,7 +1639,7 @@ def render_equity_curve(result, null) -> None:
     fig.add_trace(
         go.Scatter(
             x=result.nav.index, y=result.nav.values, mode="lines", name="With VRP",
-            line=dict(color=palette["series_1"], width=2),
+            line=dict(color=palette["series_1"], width=1.6),
             hovertemplate="%{x|%Y-%m-%d}<br>$%{y:,.0f}<extra>With VRP</extra>",
         )
     )
@@ -1620,7 +1647,7 @@ def render_equity_curve(result, null) -> None:
         fig.add_trace(
             go.Scatter(
                 x=null.nav.index, y=null.nav.values, mode="lines", name="Null (no VRP)",
-                line=dict(color=palette["series_2"], width=2),
+                line=dict(color=palette["series_2"], width=1.6),
                 hovertemplate="%{x|%Y-%m-%d}<br>$%{y:,.0f}<extra>Null</extra>",
             )
         )
@@ -1628,7 +1655,7 @@ def render_equity_curve(result, null) -> None:
         y=result.config.initial_capital,
         line=dict(color=palette["muted"], width=1, dash="dot"),
         annotation_text="Starting capital", annotation_position="bottom right",
-        annotation_font=dict(color=palette["muted"], size=11),
+        annotation_font=dict(color=palette["chrome_dim"], size=10, family=MONO),
     )
     fig.update_layout(hovermode="x unified")
     st.plotly_chart(
@@ -1651,8 +1678,8 @@ def render_drawdown(result) -> None:
     fig = go.Figure(
         go.Scatter(
             x=series.index, y=series.values * 100, mode="lines",
-            line=dict(color=palette["critical"], width=1.5),
-            fill="tozeroy", fillcolor="rgba(208,59,59,0.18)",
+            line=dict(color=palette["critical"], width=1.2),
+            fill="tozeroy", fillcolor="rgba(208,59,59,0.14)",
             hovertemplate="%{x|%Y-%m-%d}<br>%{y:.1f}%<extra></extra>",
         )
     )
