@@ -1201,6 +1201,7 @@ def load_backtest_history(symbols: tuple, start: str, end: str, _broker=None):
     less chance of a 429 on a rerun.
     """
     import backtest as bt
+    import strategies
 
     return bt.load_history(list(symbols), start, end, broker=_broker)
 
@@ -1208,6 +1209,7 @@ def load_backtest_history(symbols: tuple, start: str, end: str, _broker=None):
 def render_backtest(bot: TradingBot) -> None:
     """Replay the configured rules over history, with the VRP assumption exposed."""
     import backtest as bt
+    import strategies
 
     st.markdown('<div class="bvc-panel-title"><span class="idx">1</span>Historical replay</div>', unsafe_allow_html=True)
     st.caption(
@@ -1223,10 +1225,15 @@ def render_backtest(bot: TradingBot) -> None:
     symbols = row1[0].multiselect("Symbols", universe, default=[s for s in defaults.symbols if s in universe][:2])
     start = row1[1].text_input("Start", defaults.start_date)
     end = row1[2].text_input("End", defaults.end_date)
-    strategy_options = ["ALL — compare", "short_put", "put_credit_spread", "iron_condor"]
+    # Driven by the library, so a strategy added to strategies.py appears here
+    # without touching the UI. Calendars and diagonals are absent because this
+    # replay cannot price two expiries — see backtest.TWO_EXPIRY_STRATEGIES.
+    strategy_options = ["ALL — compare"] + list(bt.ALL_STRATEGIES)
+    active = bt._canonical_strategy(defaults.strategy)
     strategy = row1[3].selectbox(
         "Strategy", strategy_options,
-        index=strategy_options.index(defaults.strategy) if defaults.strategy in strategy_options else 1,
+        index=strategy_options.index(active) if active in strategy_options else 1,
+        format_func=lambda k: strategies.REGISTRY[k].label if k in strategies.REGISTRY else k,
     )
     compare_all = strategy == "ALL — compare"
 
@@ -1278,7 +1285,7 @@ def render_backtest(bot: TradingBot) -> None:
             return
         cfg = bt.BacktestConfig(
             symbols=symbols, start_date=start, end_date=end,
-            strategy="short_put" if compare_all else strategy,
+            strategy=bt.ALL_STRATEGIES[0] if compare_all else strategy,
             short_delta=short_delta, dte_entry=dte_entry, dte_exit=dte_exit,
             vol_rank_threshold=vol_rank, profit_target=profit_target, stop_loss=stop_loss,
             initial_capital=float(capital), max_allocation_per_asset=per_asset,
@@ -1340,6 +1347,7 @@ def render_backtest(bot: TradingBot) -> None:
 def render_strategy_comparison(comparison: dict, bot: TradingBot) -> None:
     """Every structure over the same history, ranked, with overlaid equity curves."""
     import backtest as bt
+    import strategies
 
     palette = theme()
     rows = bt.comparison_table(comparison)
@@ -1384,11 +1392,11 @@ def render_strategy_comparison(comparison: dict, bot: TradingBot) -> None:
 
     # Overlaid curves — same capital, same history, so the axis is shared and
     # the comparison is direct. Colour follows the structure, not its rank.
-    series_colours = {
-        "short_put": palette["series_1"],
-        "put_credit_spread": palette["series_2"],
-        "iron_condor": "#199e70",
-    }
+    series_colours = dict(zip(
+        bt.ALL_STRATEGIES,
+        [palette["series_1"], palette["series_2"], "#199e70",
+         "#c86ddb", "#4aa3e0", "#d9a441"],
+    ))
     fig = go.Figure()
     for name, result in comparison.items():
         if result.nav.empty:
@@ -1437,6 +1445,7 @@ SENSITIVITY_SWEEPS = {
 def render_robustness(result, prices, bot: TradingBot) -> None:
     """Overfitting diagnostics: sample size, out-of-sample, walk-forward, sweeps."""
     import backtest as bt
+    import strategies
 
     palette = theme()
     cfg = result.config

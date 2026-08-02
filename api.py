@@ -241,6 +241,77 @@ def _evidence_quality(trades: int) -> dict:
     }
 
 
+@app.get("/metrics/by", dependencies=[Depends(require_token)])
+def metrics_by(
+    field: str = Query("strategy", description="a trade-log column: strategy, underlying, exit_reason, …"),
+    currency: str = Query("usd", pattern="^(usd|zar)$"),
+    min_trades: int = Query(5, ge=1, le=1000),
+) -> dict:
+    """The same metrics, cut by any column of the trade log.
+
+    This is what makes the comparative questions answerable from the realised
+    record rather than from a backtest: *is the 45 DTE cohort beating the 30 DTE
+    one, which exit rule is actually producing the risk-adjusted return, is one
+    underlying carrying the whole month.* Group by ``strategy``,
+    ``exit_reason``, ``underlying`` or ``entry_iv_rank`` bucket and read it off.
+
+    Groups below ``min_trades`` are returned under ``too_small`` with their
+    counts rather than dropped, so a cut that looks decisive is never hiding the
+    fact that one arm had four trades in it.
+    """
+    closed = _trade_log().closed_trades()
+    groups: Dict[str, List[dict]] = {}
+    for row in closed:
+        groups.setdefault(str(row.get(field) or "unknown"), []).append(row)
+
+    sized = {k: v for k, v in groups.items() if len(v) >= min_trades}
+    payload = {
+        "field": field,
+        "currency": currency,
+        "groups": {k: engine.performance_metrics(v, currency) for k, v in sized.items()},
+        "too_small": {k: len(v) for k, v in groups.items() if k not in sized},
+        "caveat": (
+            "Cutting a short record into cohorts multiplies the comparisons and "
+            "shrinks each sample. A difference between two arms of twelve trades "
+            "each is not a finding."
+        ),
+    }
+    return payload
+
+
+@app.get("/strategies", dependencies=[Depends(require_token)])
+def strategy_catalogue() -> dict:
+    """The strategy library: what exists, what is running, how each is configured.
+
+    ``strategies`` is a pure declaration module — no broker, no orders — so the
+    research process can import it safely. Switching the active strategy is not
+    available here: it changes the payoff geometry, the capital requirement and
+    the options approval level the account needs, which makes it an operator
+    decision. Recommend one in your report instead.
+    """
+    import strategies as library
+
+    settings = _settings()
+    entries = []
+    for entry in library.catalogue():
+        store = config.StrategyConfigFile(entry["config"])
+        document = store.read()
+        entries.append({
+            **entry,
+            "active": entry["key"] == settings.strategy,
+            "parameters": document.get("parameters", {}),
+            "updated_at": document.get("updated_at"),
+            "updated_by": document.get("updated_by"),
+            "rationale": document.get("rationale"),
+        })
+    return {
+        "active": settings.strategy,
+        "switchable_from_this_api": False,
+        "how_to_switch": "set BVC_STRATEGY on the execution process and restart it",
+        "strategies": entries,
+    }
+
+
 @app.get("/events", dependencies=[Depends(require_token)])
 def events(limit: int = Query(100, ge=1, le=200)) -> dict:
     """The execution loop's event feed — entries, exits, blocks, halts."""
@@ -260,9 +331,10 @@ def audit(limit: int = Query(50, ge=1, le=1000)) -> dict:
 def get_config() -> dict:
     """Current parameters, their bounds, and what cannot be changed from here."""
     settings = _settings()
-    document = config.STRATEGY_CONFIG.read()
+    store = settings.config_store()
+    document = store.read()
     return {
-        "path": str(config.STRATEGY_CONFIG.path),
+        "path": str(store.path),
         "updated_at": document.get("updated_at"),
         "updated_by": document.get("updated_by"),
         "rationale": document.get("rationale"),
@@ -327,10 +399,11 @@ def post_config(proposal: ConfigProposal) -> dict:
         warnings.append(f"evidence is {quality['verdict']}")
 
     if accepted:
-        merged = dict(config.STRATEGY_CONFIG.parameters())
+        store = settings.config_store()
+        merged = dict(store.parameters())
         merged.update(accepted)
         try:
-            config.STRATEGY_CONFIG.write(
+            store.write(
                 merged,
                 rationale=proposal.rationale,
                 evidence=proposal.evidence,

@@ -1,11 +1,13 @@
 {
   "version": 1,
-  "updated_at": "2026-08-02T00:00:00+00:00",
+  "strategy": "call_credit_spread",
+  "label": "Call credit spread",
+  "thesis": "The same structure on the upside. Useful when IV is rich but the skew makes puts the expensive side to be short.",
+  "updated_at": "",
   "updated_by": "operator",
-  "rationale": "Baseline mechanical VRP parameters: sell the 30-delta put ~45 DTE when IV Rank > 50 and IV exceeds RV, take profit at 50% of the credit, stop at 200%, close anything still open inside 21 DTE.",
+  "rationale": "Starting parameters for Call credit spread. Not a fitted result.",
   "evidence": {
-    "out_of_sample_validated": false,
-    "note": "Defaults, not a fitted result. Every value here matches the hard-coded default in config.Settings."
+    "out_of_sample_validated": false
   },
   "parameters": {
     "target_delta": 0.3,
@@ -18,6 +20,9 @@
     "time_exit_dte": 21,
     "min_credit_usd": 0.35,
     "max_spread_pct": 0.2,
+    "spread_width": 5.0,
+    "long_leg_delta": 0.8,
+    "back_month_dte": 105,
     "max_margin_utilization": 0.5,
     "max_open_positions": 6,
     "max_new_positions_per_day": 2,

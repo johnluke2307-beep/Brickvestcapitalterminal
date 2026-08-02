@@ -43,6 +43,7 @@ from typing import Callable, Dict, List, Optional
 
 import config
 import engine
+import strategies
 from broker_client import (
     AccountSnapshot,
     BrokerClient,
@@ -225,7 +226,7 @@ class TradingBot:
         self._thread: Optional[threading.Thread] = None
         self.last_result: Optional[CycleResult] = None
         self._iv_seeded = False
-        self._config_mtime = config.STRATEGY_CONFIG.mtime()
+        self._config_mtime = self.settings.config_store().mtime()
 
     # ---------------------------------------------------------------- fail-safe
     def halt(self, reason: str) -> None:
@@ -266,7 +267,7 @@ class TradingBot:
         baseline — reloading a hundred times cannot achieve what one reload may
         not.
         """
-        stamp = config.STRATEGY_CONFIG.mtime()
+        stamp = self.settings.config_store().mtime()
         if not force and stamp == self._config_mtime:
             return {}
         self._config_mtime = stamp
@@ -295,7 +296,7 @@ class TradingBot:
         writes the file in one step; without this the next cycle would log a
         reload for a change it already made.
         """
-        self._config_mtime = config.STRATEGY_CONFIG.mtime()
+        self._config_mtime = self.settings.config_store().mtime()
 
     def _consume_halt_request(self) -> Optional[str]:
         """Honour a stop requested by another process, then delete the request.
@@ -491,7 +492,16 @@ class TradingBot:
 
     # ---------------------------------------------------------------- 2. manage
     def _manage_open_positions(self, account: AccountSnapshot) -> List[dict]:
-        """Apply the synthetic bracket to every short option position we hold."""
+        """Apply the exit rules to every open structure, leg by leg or as a whole.
+
+        Management is *trade*-centric, not position-centric. A condor's exit is a
+        decision about four legs at one net price; evaluating each leg on its own
+        would close the tested wing of a spread and leave the short naked, which
+        is the single worst thing this loop could do.
+
+        Positions with no trade-log record — opened by hand, or inherited — are
+        still managed, one leg at a time, on the broker's own entry price.
+        """
         exits: List[dict] = []
         try:
             positions = self.client.get_option_positions()
@@ -502,19 +512,51 @@ class TradingBot:
         # Settle anything the broker no longer shows before deciding anything new.
         exits.extend(self._reconcile(positions))
         working = self._working_order_symbols()
+        by_symbol = {p.symbol: p for p in positions}
+        claimed: set = set()
 
-        for position in positions:
-            if not position.is_short:
-                continue  # long wings are closed with their short leg, not alone
-            decision = self._exit_decision(position)
+        # ---- structures this bot opened -------------------------------------
+        for record in self.trade_log.all():
+            if record.get("status") != "open":
+                continue
+            legs = self._trade_legs(record)
+            # Claim before deciding, and claim even when the structure is only
+            # partly visible. A half-filled condor whose legs fall through to
+            # the single-leg path below would have its long wing closed and its
+            # short left naked — the exact failure this split exists to prevent.
+            claimed.update(leg["symbol"] for leg in legs)
+            if not all(leg["symbol"] in by_symbol for leg in legs):
+                continue  # partially filled or partially closed — _reconcile owns it
+
+            decision = self._trade_exit_decision(record, by_symbol)
             if not decision:
                 continue
-            if position.symbol in working:
-                # A close is already resting at the broker; re-sending would
-                # double the order and buy back more than we are short.
-                self.state.log_event("info", f"{position.symbol}: close order already working")
+            if any(leg["symbol"] in working for leg in legs):
+                self.state.log_event("info", f"{record.get('symbol')}: close order already working")
                 continue
 
+            reason, close_cost, pnl = decision
+            try:
+                exits.append(self._close_trade(record, legs, reason, close_cost, by_symbol))
+                self.state.log_event(
+                    "info",
+                    f"exit {record.get('strategy', 'trade')} {record.get('underlying')}: "
+                    f"{reason} at net {close_cost:.2f} (P&L ${pnl * OPTION_MULTIPLIER * int(float(record.get('contracts') or 1)):,.0f})",
+                    symbol=record.get("symbol"),
+                    reason=reason,
+                )
+            except BrokerError as exc:
+                self.state.log_event("error", f"exit failed for {record.get('symbol')}: {exc}")
+                self.halt(f"exit order failed for {record.get('symbol')}: {exc}")
+                return exits
+
+        # ---- anything short that this bot does not know about ---------------
+        for position in positions:
+            if not position.is_short or position.symbol in claimed:
+                continue
+            decision = self._exit_decision(position)
+            if not decision or position.symbol in working:
+                continue
             reason, trigger_price = decision
             try:
                 order = self._close_position(position, reason, trigger_price)
@@ -530,6 +572,119 @@ class TradingBot:
                 self.halt(f"exit order failed for {position.symbol}: {exc}")
                 break
         return exits
+
+    # ------------------------------------------------ structure-aware exits
+    @staticmethod
+    def _trade_legs(record: dict) -> List[dict]:
+        """The legs of a logged trade, tolerating rows written before the library."""
+        raw = record.get("legs")
+        if raw:
+            try:
+                legs = json.loads(raw)
+                if isinstance(legs, list) and legs:
+                    return legs
+            except (TypeError, json.JSONDecodeError):
+                pass
+        return [{"symbol": record.get("symbol"), "action": "sell", "ratio": 1}]
+
+    @staticmethod
+    def _close_cost(legs: List[dict], by_symbol: Dict[str, PositionView]) -> Optional[float]:
+        """What it costs per share to flatten the structure right now.
+
+        Positive = we pay to get out (the normal case for a credit structure).
+        Negative = closing pays us, which is what a profitable debit trade does.
+        """
+        total = 0.0
+        for leg in legs:
+            position = by_symbol.get(leg["symbol"])
+            if position is None:
+                return None
+            price = abs(position.current_price)
+            total += price * int(leg.get("ratio", 1)) * (1 if leg["action"] == "sell" else -1)
+        return round(total, 4)
+
+    def _trade_exit_decision(
+        self, record: dict, by_symbol: Dict[str, PositionView]
+    ) -> Optional[tuple[str, float, float]]:
+        """``(reason, close_cost, pnl_per_share)`` when a rule fires, else ``None``.
+
+        Exits are decided on **P&L as a fraction of the premium at risk**, which
+        is the one formulation that means the same thing for a credit structure
+        and a debit one. "Close at 50% of the credit" and "take half the debit
+        as profit" are the same rule written twice; this is the rule.
+        """
+        settings = self.settings
+        legs = self._trade_legs(record)
+        try:
+            premium = float(record.get("credit") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if premium == 0.0:
+            return None
+
+        close_cost = self._close_cost(legs, by_symbol)
+        if close_cost is None:
+            return None
+        pnl = premium - close_cost
+        at_risk = abs(premium)
+
+        # A single leg resting at the exchange already has its bracket working.
+        exchange_held = (
+            getattr(self.client.capabilities, "native_brackets", False)
+            and len(legs) == 1
+            and "native bracket" in str(record.get("note", ""))
+        )
+        if not exchange_held:
+            if pnl >= settings.profit_target_pct * at_risk:
+                return ("profit_target", close_cost, pnl)
+            if pnl <= -settings.stop_loss_multiple * at_risk:
+                return ("stop_loss", close_cost, pnl)
+
+        dtes = [by_symbol[leg["symbol"]].dte for leg in legs if by_symbol.get(leg["symbol"])]
+        dtes = [d for d in dtes if d is not None]
+        if dtes and min(dtes) <= settings.time_exit_dte:
+            return ("time_exit", close_cost, pnl)
+        return None
+
+    def _close_trade(
+        self,
+        record: dict,
+        legs: List[dict],
+        reason: str,
+        close_cost: float,
+        by_symbol: Dict[str, PositionView],
+    ) -> dict:
+        """Flatten a whole structure in one order and mark the trade closing."""
+        contracts = int(float(record.get("contracts") or 1))
+
+        if self.settings.dry_run:
+            order = {"status": "dry_run", "symbol": record.get("symbol"), "qty": contracts}
+        elif len(legs) == 1:
+            position = by_symbol[legs[0]["symbol"]]
+            order = self._close_position(position, reason, close_cost)
+            return {"symbol": position.symbol, "reason": reason, "debit": close_cost, "order": order["order"]}
+        elif reason == "stop_loss":
+            # A stop must actually get out. Market on the whole combo rather
+            # than a limit that may never fill while the loss keeps widening.
+            order = self.client.submit_combo(
+                legs=legs, qty=contracts, limit_price=None, opening=False,
+                client_order_id=f"bvc-x-{uuid.uuid4().hex[:12]}",
+            )
+        else:
+            order = self.client.submit_combo(
+                legs=legs, qty=contracts,
+                limit_price=round(-close_cost, 2),  # we pay to close → negative cashflow
+                opening=False,
+                client_order_id=f"bvc-x-{uuid.uuid4().hex[:12]}",
+            )
+
+        self.trade_log.update(
+            record["trade_id"],
+            exit_debit=f"{close_cost:.4f}",
+            exit_reason=reason,
+            status="closing",
+        )
+        return {"symbol": record.get("symbol"), "reason": reason, "debit": close_cost, "order": order}
 
     def _working_order_symbols(self) -> set:
         """Symbols with an unfilled order resting at the broker."""
@@ -592,10 +747,24 @@ class TradingBot:
         except (TypeError, ValueError):
             credit = abs(position.avg_entry_price)
 
-        price = position.current_price
-        # Fraction of the credit already captured: 1.0 = the option is worthless.
-        captured = ((credit - price) / credit) if credit > 0 else 0.0
-        decision = self._exit_decision(position)
+        decision: Optional[tuple[str, float]] = None
+        captured = 0.0
+        if record:
+            # Route through the structure-aware path so a leg of a condor shows
+            # the condor's decision, not a decision about that leg alone.
+            legs = self._trade_legs(record)
+            by_symbol = {p.symbol: p for p in self._safe_positions()}
+            if all(leg["symbol"] in by_symbol for leg in legs):
+                verdict = self._trade_exit_decision(record, by_symbol)
+                close_cost = self._close_cost(legs, by_symbol)
+                if close_cost is not None and credit:
+                    captured = (credit - close_cost) / abs(credit)
+                if verdict:
+                    decision = (verdict[0], verdict[1])
+        if decision is None and not record:
+            price = position.current_price
+            captured = ((credit - price) / credit) if credit > 0 else 0.0
+            decision = self._exit_decision(position)
 
         if decision is None:
             return {
@@ -770,24 +939,94 @@ class TradingBot:
             snapshots.append(snapshot)
         return snapshots
 
-    def _select_expiration(self, symbol: str) -> Optional[date]:
-        """Pick the listed expiry closest to the 45-DTE target inside the window."""
-        expirations = self.client.get_expirations(symbol, self.settings.dte_min, self.settings.dte_max)
+    def _select_expiration(
+        self,
+        symbol: str,
+        *,
+        dte_min: Optional[int] = None,
+        dte_max: Optional[int] = None,
+        target: Optional[int] = None,
+        after: Optional[date] = None,
+    ) -> Optional[date]:
+        """Pick the listed expiry closest to a DTE target inside a window.
+
+        ``after`` is used for the back month of a calendar or diagonal: the two
+        legs must be in genuinely different expiries, and on a chain with weekly
+        listings the nearest match to the back-month target can otherwise land
+        on the front month itself.
+        """
+        settings = self.settings
+        expirations = self.client.get_expirations(
+            symbol,
+            settings.dte_min if dte_min is None else dte_min,
+            settings.dte_max if dte_max is None else dte_max,
+        )
+        if after:
+            expirations = [d for d in expirations if d > after]
         if not expirations:
             return None
         today = datetime.now(timezone.utc).date()
-        return min(expirations, key=lambda d: abs((d - today).days - self.settings.target_dte))
+        goal = settings.target_dte if target is None else target
+        return min(expirations, key=lambda d: abs((d - today).days - goal))
 
-    def _load_chain(self, symbol: str, expiration: date, spot: float) -> List[OptionQuote]:
-        """Fetch the put chain around the money and fill in any missing greeks."""
+    def _load_chain(
+        self,
+        symbol: str,
+        expiration: date,
+        spot: float,
+        *,
+        option_type: Optional[str] = "put",
+        wide: bool = False,
+    ) -> List[OptionQuote]:
+        """Fetch a chain around the money and fill in any missing greeks.
+
+        ``option_type=None`` pulls both rights, which the two-sided strategies
+        (condor, butterfly) need. ``wide`` widens the strike window for
+        structures with legs far from the money — a 0.80-delta back-month call
+        in a diagonal sits well below spot.
+        """
+        low, high = (0.55, 1.45) if wide else (0.70, 1.05)
         chain = self.client.get_chain(
             symbol,
             expiration,
-            option_type="put",
-            strike_low=spot * 0.70,
-            strike_high=spot * 1.05,
+            option_type=option_type,
+            strike_low=spot * low,
+            strike_high=spot * high,
         )
         return self._enrich(chain, spot, expiration)
+
+    def _build_context(self, symbol: str, spot: float, expiration: date) -> strategies.BuildContext:
+        """Assemble everything the active strategy's builder is allowed to see."""
+        definition = strategies.get(self.settings.strategy)
+        two_sided = definition.key in {"iron_condor", "iron_butterfly"}
+        near = self._load_chain(
+            symbol, expiration, spot,
+            option_type=None if two_sided else self._primary_right(definition),
+            wide=definition.needs_back_month,
+        )
+        far: List[OptionQuote] = []
+        if definition.needs_back_month:
+            back = self._select_expiration(
+                symbol,
+                dte_min=self.settings.back_month_dte - 45,
+                dte_max=self.settings.back_month_dte + 60,
+                target=self.settings.back_month_dte,
+                after=expiration,
+            )
+            if back:
+                far = self._load_chain(
+                    symbol, back, spot,
+                    option_type=self._primary_right(definition), wide=True,
+                )
+        return strategies.BuildContext(
+            underlying=symbol, spot=spot, settings=self.settings, near=near, far=far
+        )
+
+    @staticmethod
+    def _primary_right(definition: strategies.StrategyDefinition) -> str:
+        """Which side of the chain a single-sided strategy trades."""
+        return "call" if definition.key in {"covered_call", "call_credit_spread",
+                                            "diagonal_spread"} else "put"
 
     def _enrich(self, chain: List[OptionQuote], spot: float, expiration: date) -> List[OptionQuote]:
         """Backfill implied volatility and delta the free feed did not supply.
@@ -884,70 +1123,84 @@ class TradingBot:
                 rejections.append(f"{snapshot.symbol}: no expiry or spot price")
                 continue
             try:
-                chain = self._load_chain(snapshot.symbol, snapshot.expiration, snapshot.spot)
-                contract = self._select_short_strike(chain)
-                if contract is None:
-                    reject(snapshot.symbol, f"no contract within {self.settings.delta_tolerance:.2f} of "
-                                            f"{self.settings.target_delta:.2f} delta")
+                ctx = self._build_context(snapshot.symbol, snapshot.spot, snapshot.expiration)
+                plan = strategies.build_plan(self.settings.strategy, ctx)
+                if plan is None:
+                    reject(snapshot.symbol, self._build_failure_reason(ctx))
                     continue
-                illiquid = self._liquidity_reject_reason(contract)
+                illiquid = self._liquidity_reject_reason(plan)
                 if illiquid:
-                    reject(snapshot.symbol, f"{contract.symbol} {illiquid}")
+                    reject(snapshot.symbol, illiquid)
                     continue
-                capital = self._capital_reject_reason(contract, account)
+                capital = self._capital_reject_reason(plan, account)
                 if capital:
                     reject(snapshot.symbol, capital)
                     continue
-                entry = self._open_position(snapshot, contract, chain)
+                entry = self._open_position(snapshot, plan)
                 if entry:
                     return entry, rejections
-                rejections.append(f"{snapshot.symbol}: net credit did not clear the minimum")
+                rejections.append(f"{snapshot.symbol}: net premium did not clear the minimum")
             except BrokerError as exc:
                 self.state.log_event("error", f"entry failed for {snapshot.symbol}: {exc}")
                 raise
         return None, rejections
 
-    def _select_short_strike(self, chain: List[OptionQuote]) -> Optional[OptionQuote]:
-        """The put whose delta is closest to the 30-delta target, within tolerance."""
-        target = abs(self.settings.target_delta)
-        tolerance = self.settings.delta_tolerance
-        scored = [
-            (abs(abs(q.delta) - target), q)
-            for q in chain
-            if q.delta is not None and abs(abs(q.delta) - target) <= tolerance and q.mid
-        ]
-        if not scored:
-            return None
-        scored.sort(key=lambda item: item[0])
-        return scored[0][1]
+    def _build_failure_reason(self, ctx: strategies.BuildContext) -> str:
+        """Say which leg the chain could not supply, not just 'no trade'.
 
-    def _liquidity_reject_reason(self, contract: OptionQuote) -> Optional[str]:
-        """Reject wide or thin quotes — slippage is the tax on a small edge."""
+        A strategy that silently declines to build is indistinguishable from a
+        broken scanner, and the two want completely different responses.
+        """
         settings = self.settings
-        if not contract.has_two_sided_quote:
-            return "no two-sided quote"
-        mid = contract.mid or 0.0
-        if mid < settings.min_credit_usd:
-            return f"credit ${mid:.2f} below the ${settings.min_credit_usd:.2f} minimum"
-        spread = contract.spread_pct
-        if spread is None or spread > settings.max_spread_pct:
-            return f"bid/ask spread {spread:.0%} exceeds {settings.max_spread_pct:.0%} of mid"
+        definition = strategies.get(settings.strategy)
+        if definition.needs_back_month and not ctx.far:
+            return f"no back-month expiry near {settings.back_month_dte} DTE"
+        return (
+            f"chain has no {definition.label.lower()} within "
+            f"{settings.delta_tolerance:.2f} of {settings.target_delta:.2f} delta"
+            + (f" with a {settings.spread_width:g}-wide wing" if definition.is_multi_leg else "")
+        )
+
+    def _liquidity_reject_reason(self, plan: strategies.StrategyPlan) -> Optional[str]:
+        """Reject wide or thin quotes — slippage is the tax on a small edge.
+
+        Every leg is checked, not just the short one. A condor whose far wing is
+        quoted 0.05 × 0.40 is a condor you cannot get out of, and the profit
+        target will never be reachable at a price anyone will pay.
+        """
+        settings = self.settings
+        for leg in plan.legs:
+            quote = leg.quote
+            if not quote.has_two_sided_quote:
+                return f"{quote.symbol}: no two-sided quote"
+            spread = quote.spread_pct
+            if spread is None or spread > settings.max_spread_pct:
+                return (
+                    f"{quote.symbol}: bid/ask spread {spread:.0%} exceeds "
+                    f"{settings.max_spread_pct:.0%} of mid"
+                )
+        if plan.premium_at_risk < settings.min_credit_usd:
+            label = "credit" if plan.is_credit else "debit"
+            return (
+                f"net {label} ${plan.premium_at_risk:.2f} below the "
+                f"${settings.min_credit_usd:.2f} minimum"
+            )
         return None
 
-    def _capital_reject_reason(self, contract: OptionQuote, account: AccountSnapshot) -> Optional[str]:
+    def _capital_reject_reason(
+        self, plan: strategies.StrategyPlan, account: AccountSnapshot
+    ) -> Optional[str]:
         """Check the trade fits *and* leaves the margin ceiling intact afterwards.
 
-        For a cash-secured put the requirement is the full strike notional; a
-        defined-risk spread only needs the width. The projected post-trade margin
-        utilisation must still sit under the ceiling — the guardrail is forward
-        looking, so a trade that would breach it is never sent in the first place.
+        The requirement comes from the strategy itself — strike notional for a
+        cash-secured put, one wing's width for a condor, the debit for a
+        calendar. The projected post-trade margin utilisation must still sit
+        under the ceiling: the guardrail is forward looking, so a trade that
+        would breach it is never sent in the first place.
         """
         settings = self.settings
         contracts = max(settings.contracts_per_trade, 1)
-        if settings.strategy == "put_credit_spread":
-            requirement = settings.spread_width * OPTION_MULTIPLIER * contracts
-        else:
-            requirement = contract.strike * OPTION_MULTIPLIER * contracts
+        requirement = plan.capital_required * contracts
 
         if account.options_buying_power and requirement > account.options_buying_power:
             return (
@@ -964,124 +1217,129 @@ class TradingBot:
         return None
 
     def _open_position(
-        self, snapshot: engine.VRPSnapshot, contract: OptionQuote, chain: List[OptionQuote]
+        self, snapshot: engine.VRPSnapshot, plan: strategies.StrategyPlan
     ) -> Optional[dict]:
-        """Sell the contract, record the managed bracket levels, log the trade."""
+        """Send the plan as one order, record the exit levels, log the trade."""
         settings = self.settings
+        definition = strategies.get(plan.strategy)
         contracts = max(settings.contracts_per_trade, 1)
-        credit = contract.mid or 0.0
+        premium = plan.net_premium
         trade_id = uuid.uuid4().hex[:12]
+        short_leg = plan.short_leg
+        anchor = short_leg.quote if short_leg else plan.legs[0].quote
 
-        long_leg: Optional[OptionQuote] = None
-        if settings.strategy == "put_credit_spread":
-            long_leg = self._select_long_wing(chain, contract)
-            if long_leg is None:
-                self.state.log_event("info", f"{snapshot.symbol}: no long wing available for the spread")
-                return None
-            credit = max((contract.mid or 0.0) - (long_leg.mid or 0.0), 0.0)
-
-        if credit < settings.min_credit_usd:
-            self.state.log_event("info", f"{snapshot.symbol}: net credit ${credit:.2f} below the minimum")
+        if plan.premium_at_risk < settings.min_credit_usd:
+            self.state.log_event(
+                "info", f"{snapshot.symbol}: net premium ${plan.premium_at_risk:.2f} below the minimum"
+            )
             return None
 
-        take_profit = round(credit * (1 - settings.profit_target_pct), 2)
-        stop_price = round(credit * settings.stop_loss_price_multiple, 2)
+        legs = [{"symbol": leg.symbol, "action": leg.action, "ratio": leg.ratio} for leg in plan.legs]
         native = getattr(self.client.capabilities, "native_brackets", False)
+        # Resting brackets only exist for a single leg. A four-leg condor's exit
+        # is a net price on the whole structure, which no exchange will hold —
+        # those stay managed by this loop, and the trade log says which is which.
+        use_native = native and len(plan.legs) == 1 and plan.is_credit
 
         # ---- send the order ------------------------------------------------
         if settings.dry_run:
-            order = {"status": "dry_run", "symbol": contract.symbol, "qty": contracts}
-        elif native and long_leg is None:
-            # The exits rest at the exchange, so they survive this process
-            # dying. That is the whole reason to run IBKR.
+            order = {"status": "dry_run", "symbol": anchor.symbol, "qty": contracts}
+        elif use_native:
             order = self.client.submit_bracketed_short(
-                symbol=contract.symbol,
+                symbol=anchor.symbol,
                 qty=contracts,
-                credit=round(credit, 2),
-                take_profit=max(take_profit, 0.01),
-                stop_loss=stop_price,
+                credit=round(premium, 2),
+                take_profit=max(round(premium * (1 - settings.profit_target_pct), 2), 0.01),
+                stop_loss=round(premium * settings.stop_loss_price_multiple, 2),
                 client_order_id=f"bvc-o-{trade_id}",
             )
-        elif long_leg is not None:
-            order = self.client.submit_vertical_spread(
-                short_symbol=contract.symbol,
-                long_symbol=long_leg.symbol,
+        elif len(plan.legs) > 1:
+            order = self.client.submit_combo(
+                legs=legs,
                 qty=contracts,
-                limit_price=-round(credit, 2),  # negative limit = net credit
+                limit_price=round(premium, 2),   # signed: + we are paid, − we pay
                 opening=True,
                 client_order_id=f"bvc-o-{trade_id}",
             )
         else:
             order = self.client.submit_option_order(
-                symbol=contract.symbol,
+                symbol=anchor.symbol,
                 qty=contracts,
-                side="sell",
-                position_intent="sell_to_open",
-                limit_price=round(credit, 2),
+                side="sell" if plan.legs[0].is_short else "buy",
+                position_intent="sell_to_open" if plan.legs[0].is_short else "buy_to_open",
+                limit_price=round(abs(premium), 2),
                 client_order_id=f"bvc-o-{trade_id}",
             )
 
-        fill = float(order.get("filled_avg_price") or credit)
+        # A single-leg fill price is the leg's price; a combo's is the net.
+        fill = float(order.get("filled_avg_price") or abs(premium))
+        fill = fill if premium >= 0 else -fill
         quote = self.fx.get_rate()
         self.trade_log.append(
             {
                 "trade_id": trade_id,
                 "opened_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "underlying": snapshot.symbol,
-                "symbol": contract.symbol,
-                "strategy": settings.strategy,
+                "symbol": anchor.symbol,
+                "strategy": plan.strategy,
                 "contracts": contracts,
-                "strike": f"{contract.strike:.2f}",
-                "expiration": contract.expiration.isoformat(),
-                "entry_delta": f"{contract.delta:.4f}" if contract.delta is not None else "",
+                "strike": f"{anchor.strike:.2f}",
+                "expiration": plan.nearest_expiration.isoformat(),
+                "entry_delta": f"{anchor.delta:.4f}" if anchor.delta is not None else "",
                 "entry_iv": f"{snapshot.implied_vol:.4f}" if snapshot.implied_vol else "",
                 "entry_rv": f"{snapshot.reference_rv:.4f}" if snapshot.reference_rv else "",
                 "entry_iv_rank": f"{snapshot.iv_rank.value:.1f}" if snapshot.iv_rank.value is not None else "",
+                # ``credit`` stays the column name for backward compatibility with
+                # existing logs; it is now the signed net premium.
                 "credit": f"{fill:.4f}",
+                "legs": json.dumps(legs),
+                "capital_required": f"{plan.capital_required * contracts:.2f}",
+                "max_loss": f"{plan.max_loss * contracts:.2f}" if plan.max_loss is not None else "",
                 "usd_zar": f"{quote.rate:.4f}",
                 "status": "open",
                 "note": (
                     f"{'native' if order.get('bracket') else 'managed'} bracket: "
-                    f"take profit {fill * (1 - settings.profit_target_pct):.2f}, "
-                    f"stop {fill * settings.stop_loss_price_multiple:.2f}"
-                    + (f", long wing {long_leg.symbol}" if long_leg else "")
+                    f"take profit at {settings.profit_target_pct:.0%} of "
+                    f"${abs(fill):.2f} {'credit' if fill >= 0 else 'debit'}, "
+                    f"stop at {settings.stop_loss_multiple:.0%} — {plan.describe()}"
                 ),
             }
         )
         self.state.note_entry()
 
-        expected = engine.theoretical_expectancy(fill, contract.delta or -settings.target_delta, contracts=contracts)
+        expected = engine.theoretical_expectancy(
+            abs(fill), anchor.delta or -settings.target_delta, contracts=contracts
+        )
         self.state.log_event(
             "info",
-            f"opened {contract.symbol} for ${fill:.2f} credit "
-            f"(IVR {snapshot.iv_rank.value:.0f}, VRP {(snapshot.vrp or 0) * 100:.1f}pts, "
-            f"delta-implied win rate {expected.p_win:.0%} vs {expected.breakeven_p_win:.0%} breakeven)",
-            symbol=contract.symbol,
+            f"opened {definition.label} on {snapshot.symbol} "
+            f"({plan.describe()}) for ${abs(fill):.2f} "
+            f"{'credit' if fill >= 0 else 'debit'} "
+            f"(IVR {snapshot.iv_rank.value:.0f}, VRP {(snapshot.vrp or 0) * 100:.1f}pts)",
+            symbol=anchor.symbol,
         )
         return {
             "trade_id": trade_id,
-            "symbol": contract.symbol,
+            "symbol": anchor.symbol,
             "underlying": snapshot.symbol,
+            "strategy": plan.strategy,
             "credit": fill,
+            "net_premium": fill,
+            "legs": legs,
             "contracts": contracts,
-            "delta": contract.delta,
-            "expiration": contract.expiration.isoformat(),
-            "take_profit": round(fill * (1 - settings.profit_target_pct), 2),
-            "stop_loss": round(fill * settings.stop_loss_price_multiple, 2),
+            "delta": anchor.delta,
+            "net_delta": plan.net_delta,
+            "expiration": plan.nearest_expiration.isoformat(),
+            "capital_required": plan.capital_required * contracts,
+            "max_loss": (plan.max_loss * contracts) if plan.max_loss is not None else None,
+            "take_profit": round(abs(fill) * (1 - settings.profit_target_pct), 2),
+            "stop_loss": round(abs(fill) * settings.stop_loss_price_multiple, 2),
             "expectancy_usd": expected.expectancy,
             "p_win_delta": expected.p_win,
             "p_win_breakeven": expected.breakeven_p_win,
             "native_bracket": bool(order.get("bracket")),
             "order": order,
         }
-
-    def _select_long_wing(self, chain: List[OptionQuote], short: OptionQuote) -> Optional[OptionQuote]:
-        """The protective put ``spread_width`` below the short strike."""
-        target = short.strike - self.settings.spread_width
-        below = [q for q in chain if q.strike < short.strike and q.mid]
-        if not below:
-            return None
-        return min(below, key=lambda q: abs(q.strike - target))
 
     # ------------------------------------------------------- background looping
     def start(self, interval_seconds: Optional[int] = None) -> bool:

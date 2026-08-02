@@ -204,7 +204,7 @@ class HermesControl:
                 "enabled": self.enabled,
                 "may_resume_after_halt": False,
                 "experiments_proposed": self.audit.experiment_count(),
-                "config_file": str(config.STRATEGY_CONFIG.path),
+                "config_file": str(settings.config_store().path),
                 "overlay_applied": settings.overlay_applied,
                 "overlay_rejected": settings.overlay_rejected,
                 # Stated explicitly so the agent never has to discover these the
@@ -366,10 +366,11 @@ class HermesControl:
                 setattr(settings, name, value)
             # Persist to the JSON contract so the change survives a restart and
             # shows up as a reviewable diff rather than as in-memory drift.
-            merged = dict(config.STRATEGY_CONFIG.parameters())
+            store = settings.config_store()
+            merged = dict(store.parameters())
             merged.update(accepted)
             try:
-                config.STRATEGY_CONFIG.write(
+                store.write(
                     merged, rationale=rationale, evidence=evidence, actor="hermes"
                 )
                 self.bot.mark_config_current()

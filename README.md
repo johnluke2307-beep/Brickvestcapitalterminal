@@ -49,8 +49,13 @@ trade, computed from the short strike's delta and the managed exits.
 | `ibkr_client.py` | Interactive Brokers via ib_async — resting brackets, real IV history |
 | `engine.py` | Black-Scholes, realised-volatility estimators, VRP, IV Rank, expectancy, USD→ZAR |
 | `bot.py` | The execution loop: preflight → manage → scan → enter |
-| `hermes.py` | Control surface for an external self-improvement agent |
-| `config.py` | Every tunable, resolved from env vars → `st.secrets` → defaults |
+| `strategies.py` | The strategy library — eight structures as declarations, no broker imports |
+| `strategies/*.json` | One parameter file per strategy; the agent's entire write surface |
+| `hermes.py` | In-process control surface for an external self-improvement agent |
+| `api.py` | Read-mostly HTTP telemetry + bounded parameter control. No order path |
+| `memory.py` | Durable research notes via Honcho, falling back to a local JSONL |
+| `skills/options_optimizer.md` | The daily post-close review procedure Hermes follows |
+| `config.py` | Every tunable, resolved from `strategies/<strategy>.json` → env → `st.secrets` → defaults |
 | `.streamlit/config.toml` | Terminal chrome — dark deck, monospace figures |
 | `requirements.txt` | Six dependencies, all free-tier friendly |
 | `tests/test_engine.py` | Maths regression tests (no network, no credentials) |
@@ -59,6 +64,59 @@ trade, computed from the short strike's delta and the managed exits.
 estimate. `bot.py` and `app.py` talk to the broker only through `BrokerClient`,
 whose surface is small enough that an IBKR implementation can replace it without
 touching anything else.
+
+`api.py`, `memory.py` and `strategies.py` have no broker dependency either, and
+that is enforced rather than intended: a test parses their import graphs and
+fails if any of them can reach `bot`, `broker_client`, `ibkr_client`, `ib_async`
+or `alpaca` at runtime. The research layer is separated from the execution layer
+by the module graph, not by good behaviour.
+
+---
+
+## The strategy library
+
+One execution engine, one risk engine, one dashboard, eight strategies. A
+strategy is a *declaration* — which legs to select from a chain, what capital
+they consume, what the payoff geometry is. Everything after that is shared and
+does not know which strategy it is running.
+
+| Strategy | Legs | Risk | Wants | Notes |
+|---|---|---|---|---|
+| `cash_secured_put` | 1 | undefined | high IV | The live default. Assignment leaves you long stock |
+| `covered_call` | 1 | undefined | high IV | Needs 100 shares per contract already held |
+| `put_credit_spread` | 2 | defined | high IV | The CSP with the tail bought back |
+| `call_credit_spread` | 2 | defined | high IV | The same trade on the upside |
+| `iron_condor` | 4 | defined | high IV | ~2× the credit of one vertical for the same margin |
+| `iron_butterfly` | 4 | defined | high IV | Shorts at the money — bigger credit, narrower zone |
+| `calendar_spread` | 2 | defined | **low IV** | A debit trade, and the only long-volatility one here |
+| `diagonal_spread` | 2 | defined | high IV | Poor man's covered call |
+
+Select with `BVC_STRATEGY`; parameters come from `strategies/<key>.json`.
+Regenerate the files with `python strategies.py --write-configs`.
+
+**Credit and debit share one exit rule.** Six of these collect premium; the
+calendar and diagonal pay it. Rather than special-case them, every plan reports
+a *signed net premium* and exits are decided on P&L as a fraction of the premium
+at risk:
+
+```
+profit when   pnl >=  profit_target_pct × |net premium|
+stop   when   pnl <= −stop_loss_multiple × |net premium|
+```
+
+For a short put that is exactly "close at 50% of the credit, stop at 200%". For
+a calendar it reads "take half the debit as profit, stop at twice it". One rule,
+so a comparison between two strategies is a comparison of the strategies rather
+than of two different exit regimes.
+
+**Multi-leg trades are managed as trades, not as positions.** A condor's exit is
+one decision about four legs at one net price. Evaluating each leg on its own
+would close the tested wing of a spread and leave the short naked — the single
+worst thing the loop could do — so the trade log carries the legs and the exit
+logic reads them.
+
+Adding a strategy: write a builder, register a `StrategyDefinition`, drop a JSON
+file in `strategies/`. Nothing in `bot.py` changes.
 
 ### Cycle
 
@@ -244,13 +302,64 @@ hermes.halt("drawdown breach")                 # always permitted
 Or over JSON from another process: `python hermes.py observe`,
 `python hermes.py bounds`, `echo '{...}' | python hermes.py propose`.
 
+### The separated path (this is the one to use)
+
+The agent does not call into the trading process at all. It writes a file; the
+execution loop reads it between cycles.
+
+```
+research process                    execution process
+────────────────                    ─────────────────
+api.py  ──writes──►  strategies/iron_condor.json  ──read at cycle start──►  bot.py
+        ──writes──►  state/halt_request.json      ──consumed once──────────►
+        ◄──reads───  state/trade_log.csv, bot_state.json, hermes_audit.jsonl
+```
+
+`api.py` runs standalone and has **no broker in its import graph**, so heavy LLM
+inference on that side can never stall the ib_async event loop or delay a fill.
+
+```bash
+pip install fastapi uvicorn
+BVC_API_TOKEN=$(openssl rand -hex 24) uvicorn api:app --port 8787
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Is the loop alive, is it halted |
+| `GET /metrics` | Sharpe, Sortino, win rate, expectancy, drawdown — **plus its own reliability verdict** |
+| `GET /metrics/by?field=` | The same, cut by any trade-log column: strategy, exit reason, underlying |
+| `GET /trades`, `/pnl`, `/events` | The realised record and the Rand target |
+| `GET /strategies` | The library, which is active, each one's parameters |
+| `GET /config` | Parameters, bounds, ratchet directions, what is immovable |
+| `POST /config` | One bounded proposal — vetted, audited, written to the strategy file |
+| `POST /halt` | Stop the bot. No matching resume |
+
+The daily procedure the agent follows is `skills/options_optimizer.md`. Its
+standing default is **propose nothing**, and most days that is the correct
+output: this edge is structural and small, and it survives on being executed the
+same way for a long time.
+
+### The kill switch Hermes cannot reach
+
+`bot.DAILY_LOSS_LIMIT_PCT` (default 3% of start-of-day equity) halts the loop
+before any other account check. It is **not** a field on `config.Settings`, so
+it is not in `HERMES_BOUNDS` and cannot be expressed in a strategy config file
+at all. An agent tuning for return has every incentive to widen a daily loss
+limit; the design answer is not to trust it not to, but to put the limit
+somewhere the agent has no word for. A test asserts this, and would fail if
+anyone added one.
+
+Set `BVC_KILL_SWITCH_FLATTEN=true` on a venue with no resting brackets, where a
+halted bot means an unmanaged short.
+
 **The contract is deliberately asymmetric — reads wide, writes narrow:**
 
 | Invariant | Why |
 |---|---|
 | **Risk limits ratchet one way** | The agent may tighten a guardrail, never loosen it — whatever the rationale. A system optimising "make more money" reads a margin ceiling as an obstacle. The worst case of a misaligned Hermes is an account that trades too little. |
 | **Halt always, resume never** | Stopping needs no permission. Clearing a halt stays a human act, because the halt exists for exactly the conditions the automation misread. |
-| **Fixed mutable set** | Venue, universe, credentials and the paper/live flag are not the agent's to change. Promoting to live is a human decision by construction. |
+| **Fixed mutable set** | Venue, universe, credentials, the paper/live flag and the daily loss kill switch are not the agent's to change. Promoting to live is a human decision by construction. |
+| **Strategy selection is the operator's** | Switching from a cash-secured put to an iron condor changes the payoff geometry, the capital per trade and the options approval level the account needs. Hermes can compare structures and recommend one; it cannot switch. |
 | **Rationale required** | Every proposal carries one, and every proposal — accepted or rejected — is appended to `state/hermes_audit.jsonl` before anything changes. |
 | **Off by default** | `BVC_HERMES_ENABLED=true` is required before anything can change how this trades. |
 

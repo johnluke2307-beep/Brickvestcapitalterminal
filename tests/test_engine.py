@@ -11,6 +11,7 @@ that define the VRP, and the expectancy formula the whole platform reports on.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import random
@@ -557,9 +558,40 @@ def test_compare_strategies_shares_one_history() -> None:
         assert result.config.vrp_points == cfg.vrp_points
 
     rows = bt.comparison_table(results)
-    assert len(rows) == 3
+    assert len(rows) == len(bt.ALL_STRATEGIES)
     # Ranked by return, best first.
     assert rows == sorted(rows, key=lambda r: r["total_return"], reverse=True)
+
+
+def test_two_expiry_strategies_are_refused_not_approximated() -> None:
+    """This replay prices one expiry. A calendar must fail loudly, not quietly."""
+    import backtest as bt
+
+    prices = {"SPY": _synthetic_frame(seed=11)}
+    for name in bt.TWO_EXPIRY_STRATEGIES:
+        cfg = bt.BacktestConfig(symbols=["SPY"], start_date="2020-01-01", end_date="2021-01-01",
+                                strategy=name)
+        try:
+            bt.Backtester(cfg, prices).run()
+        except ValueError as exc:
+            assert "two expiries" in str(exc)
+        else:
+            raise AssertionError(f"{name} silently produced a result it cannot model")
+
+
+def test_short_put_stays_a_valid_name_for_the_cash_secured_put() -> None:
+    """Old configs and saved comparisons must not break on a rename."""
+    import backtest as bt
+
+    prices = {"SPY": _synthetic_frame(seed=11)}
+    cfg = bt.BacktestConfig(symbols=["SPY"], start_date="2020-01-01", end_date="2021-06-01",
+                            strategy="short_put", initial_capital=250_000.0)
+    legacy = bt.Backtester(cfg, prices).run()
+    canonical = bt.Backtester(
+        bt.BacktestConfig(**{**cfg.__dict__, "strategy": "cash_secured_put"}), prices
+    ).run()
+    assert legacy.metrics["total_return"] == canonical.metrics["total_return"]
+    assert len(legacy.trades) == len(canonical.trades)
 
 
 def test_capital_is_respected_end_to_end() -> None:
@@ -1153,10 +1185,26 @@ def test_the_research_layer_has_no_import_path_to_an_order() -> None:
     root = Path(__file__).resolve().parents[1]
     forbidden = {"bot", "broker_client", "ibkr_client", "ib_async", "ib_insync", "alpaca"}
 
-    for module in ("api.py", "memory.py"):
+    # strategies.py is included because the research layer imports it to
+    # reason about the library; it must stay a pure declaration module.
+    for module in ("api.py", "memory.py", "strategies.py"):
         tree = ast.parse((root / module).read_text())
+
+        # Imports under `if TYPE_CHECKING:` never execute, so they create no
+        # runtime path to a broker. Everything else counts, including imports
+        # tucked inside a function body.
+        type_only = {
+            child
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If) and ast.unparse(node.test).endswith("TYPE_CHECKING")
+            for stmt in node.body
+            for child in ast.walk(stmt)
+        }
+
         imported = set()
         for node in ast.walk(tree):
+            if node in type_only:
+                continue
             if isinstance(node, ast.Import):
                 imported.update(alias.name.split(".")[0] for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
@@ -1177,6 +1225,268 @@ def test_performance_metrics_report_their_own_reliability() -> None:
     assert metrics["reliability"] == "insufficient"
     assert approx(metrics["total_pnl"], 95.0)
     assert metrics["max_drawdown"] < 0  # the -260 leg must show as a drawdown
+
+
+# ======================================================================================
+# The strategy library
+# ======================================================================================
+def _chain(spot: float = 100.0, expiry_days: int = 45, vol: float = 0.22):
+    """A synthetic but internally consistent chain: real Black-Scholes prices.
+
+    Prices and deltas come from the same model, so a builder that picks the
+    0.30-delta strike gets a contract that really is 0.30 delta — a chain of
+    made-up numbers would let a broken selector pass.
+    """
+    expiration = date.today() + timedelta(days=expiry_days)
+    t = engine.year_fraction(expiration)
+    quotes = []
+    for strike in [spot * (1 + i * 0.025) for i in range(-14, 9)]:
+        strike = round(strike, 0)
+        for right in ("put", "call"):
+            is_call = right == "call"
+            price = engine.bs_price(spot, strike, t, vol, 0.043, is_call)
+            delta = engine.bs_delta(spot, strike, t, vol, 0.043, is_call)
+            quotes.append(
+                OptionQuote(
+                    symbol=f"XYZ{expiration:%y%m%d}{'C' if is_call else 'P'}{int(strike * 1000):08d}",
+                    underlying="XYZ",
+                    expiration=expiration,
+                    strike=strike,
+                    option_type=right,
+                    bid=round(max(price - 0.03, 0.01), 2),
+                    ask=round(price + 0.03, 2),
+                    implied_volatility=vol,
+                    delta=delta,
+                )
+            )
+    return quotes
+
+
+def _ctx(strategy: str = "cash_secured_put", **overrides):
+    import config as cfgmod
+    import strategies as lib
+
+    settings = cfgmod.Settings()
+    settings.strategy = strategy
+    settings.delta_tolerance = 0.10
+    for key, value in overrides.items():
+        setattr(settings, key, value)
+    return lib.BuildContext(
+        underlying="XYZ", spot=100.0, settings=settings,
+        near=_chain(), far=_chain(expiry_days=105, vol=0.20),
+    )
+
+
+def test_every_registered_strategy_builds_from_a_normal_chain() -> None:
+    """The library's own contract: eight strategies, eight plans, no exceptions."""
+    import strategies as lib
+
+    for key in lib.REGISTRY:
+        plan = lib.build_plan(key, _ctx(key))
+        assert plan is not None, f"{key} produced no plan from a healthy chain"
+        assert plan.legs, f"{key} produced a plan with no legs"
+        assert plan.capital_required > 0, f"{key} claims to need no capital"
+        assert len(plan.legs) == lib.get(key).leg_count, f"{key} leg count disagrees with its definition"
+
+
+def test_credit_and_debit_strategies_have_the_right_sign() -> None:
+    """A calendar that reports a credit is a calendar priced wrong."""
+    import strategies as lib
+
+    for key in ("cash_secured_put", "put_credit_spread", "iron_condor", "iron_butterfly"):
+        assert lib.build_plan(key, _ctx(key)).net_premium > 0, f"{key} should collect premium"
+    for key in ("calendar_spread", "diagonal_spread"):
+        assert lib.build_plan(key, _ctx(key)).net_premium < 0, f"{key} should pay premium"
+
+
+def test_iron_condor_sells_both_sides_and_buys_both_wings() -> None:
+    """Four legs, one short pair inside one long pair, margin = one wing."""
+    import strategies as lib
+
+    plan = lib.build_plan("iron_condor", _ctx("iron_condor", target_delta=0.20, spread_width=5.0))
+    puts = sorted([l for l in plan.legs if l.quote.option_type == "put"], key=lambda l: l.quote.strike)
+    calls = sorted([l for l in plan.legs if l.quote.option_type == "call"], key=lambda l: l.quote.strike)
+
+    assert len(puts) == len(calls) == 2
+    assert not puts[0].is_short and puts[1].is_short     # long wing below the short put
+    assert calls[0].is_short and not calls[1].is_short   # short call below the long wing
+    assert puts[1].quote.strike < calls[0].quote.strike  # a condor, not a butterfly
+
+    # Only one side can finish in the money, so the requirement is one wing.
+    width = max(puts[1].quote.strike - puts[0].quote.strike,
+                calls[1].quote.strike - calls[0].quote.strike)
+    assert approx(plan.capital_required, width * 100, 1e-6)
+    assert approx(plan.max_loss + plan.max_profit, width * 100, 1e-3)
+
+
+def test_iron_butterfly_body_sits_at_the_money() -> None:
+    """The butterfly's defining property: both shorts on the same strike."""
+    import strategies as lib
+
+    plan = lib.build_plan("iron_butterfly", _ctx("iron_butterfly", spread_width=10.0))
+    shorts = [l for l in plan.legs if l.is_short]
+    assert len(shorts) == 2
+    assert shorts[0].quote.strike == shorts[1].quote.strike
+    assert abs(shorts[0].quote.strike - 100.0) <= 2.5      # at the money
+
+    condor = lib.build_plan("iron_condor", _ctx("iron_condor", target_delta=0.20, spread_width=10.0))
+    # Collapsing the shorts to the money is what buys the bigger credit.
+    assert plan.net_premium > condor.net_premium
+
+
+def test_calendar_needs_two_expiries_and_declines_without_one() -> None:
+    """A 'calendar' inside one expiry is not a calendar — refuse to build it."""
+    import strategies as lib
+
+    ctx = _ctx("calendar_spread")
+    ctx.far = ()
+    assert lib.build_plan("calendar_spread", ctx) is None
+
+    plan = lib.build_plan("calendar_spread", _ctx("calendar_spread"))
+    assert len(plan.expirations) == 2
+    front, back = plan.legs
+    assert front.is_short and not back.is_short
+    assert front.quote.expiration < back.quote.expiration
+    assert front.quote.strike == back.quote.strike
+
+
+def test_diagonal_long_leg_is_deep_and_further_out() -> None:
+    """The back-month leg has to behave like stock, or it is not a PMCC."""
+    import strategies as lib
+
+    plan = lib.build_plan("diagonal_spread", _ctx("diagonal_spread", long_leg_delta=0.80))
+    short, long = plan.legs
+    assert short.is_short and not long.is_short
+    assert long.quote.strike < short.quote.strike
+    assert long.quote.expiration > short.quote.expiration
+    assert abs(long.quote.delta) >= 0.65
+
+
+def test_delta_tolerance_is_enforced_not_nearest_wins() -> None:
+    """On a thin chain, 'nearest' can be a completely different trade."""
+    import strategies as lib
+
+    ctx = _ctx("cash_secured_put", target_delta=0.30, delta_tolerance=0.001)
+    ctx.near = [q for q in ctx.near if abs(q.delta or 0) < 0.10 or abs(q.delta or 0) > 0.60]
+    assert lib.build_plan("cash_secured_put", ctx) is None
+
+
+def test_defined_risk_strategies_cap_the_loss() -> None:
+    """The whole reason to buy a wing: a bounded worst case, and it must be bounded."""
+    import strategies as lib
+
+    for key in ("put_credit_spread", "call_credit_spread", "iron_condor", "iron_butterfly"):
+        plan = lib.build_plan(key, _ctx(key))
+        assert lib.get(key).defined_risk
+        assert plan.max_loss is not None and plan.max_loss > 0
+        assert plan.max_loss <= plan.capital_required
+
+    naked = lib.build_plan("cash_secured_put", _ctx("cash_secured_put"))
+    assert not lib.get("cash_secured_put").defined_risk
+    # The undefined case still reports its true worst case: the strike, less credit.
+    assert naked.max_loss > 50 * 100
+
+
+def test_the_exit_rule_means_the_same_thing_for_credit_and_debit() -> None:
+    """One rule, expressed on P&L rather than on price.
+
+    A 50% profit target must mean "half the credit" for a short put and "half
+    the debit" for a calendar. Testing it directly against the bot's own
+    decision function, because that is what will actually run.
+    """
+    from bot import TradingBot
+    from broker_client import PositionView
+
+    bot, _, settings = _hermes_pair("exitrule")
+    settings.profit_target_pct = 0.50
+    settings.stop_loss_multiple = 2.0
+    settings.time_exit_dte = 0
+
+    def position(symbol: str, qty: float, price: float) -> PositionView:
+        return PositionView(
+            symbol=symbol, qty=qty, avg_entry_price=price, current_price=price,
+            market_value=0.0, cost_basis=0.0, unrealized_pl=0.0, unrealized_plpc=0.0,
+            asset_class="us_option", option_type="put",
+            expiration=date.today() + timedelta(days=40),
+        )
+
+    # Credit structure: sold for 2.00, now worth 1.00 → half the credit captured.
+    credit_record = {"credit": "2.0", "contracts": "1", "status": "open",
+                     "legs": json.dumps([{"symbol": "A", "action": "sell", "ratio": 1}])}
+    reason, cost, pnl = bot._trade_exit_decision(credit_record, {"A": position("A", -1, 1.00)})
+    assert reason == "profit_target" and approx(pnl, 1.0)
+
+    # Debit structure: paid 2.00, now worth 3.00 → half the debit made.
+    debit_record = {"credit": "-2.0", "contracts": "1", "status": "open",
+                    "legs": json.dumps([{"symbol": "A", "action": "sell", "ratio": 1},
+                                        {"symbol": "B", "action": "buy", "ratio": 1}])}
+    verdict = bot._trade_exit_decision(
+        debit_record, {"A": position("A", -1, 1.00), "B": position("B", 1, 4.00)}
+    )
+    assert verdict[0] == "profit_target" and approx(verdict[2], 1.0)
+
+    # And the stop fires on the same arithmetic, in both directions.
+    stopped = bot._trade_exit_decision(credit_record, {"A": position("A", -1, 6.10)})
+    assert stopped[0] == "stop_loss"
+
+
+def test_a_multi_leg_exit_is_decided_on_the_whole_structure() -> None:
+    """Never close one wing of a spread and leave the short naked."""
+    from broker_client import PositionView
+
+    bot, _, settings = _hermes_pair("structure")
+    settings.profit_target_pct = 0.50
+    settings.stop_loss_multiple = 2.0
+    settings.time_exit_dte = 0
+
+    def leg(symbol: str, qty: float, price: float) -> PositionView:
+        return PositionView(
+            symbol=symbol, qty=qty, avg_entry_price=price, current_price=price,
+            market_value=0.0, cost_basis=0.0, unrealized_pl=0.0, unrealized_plpc=0.0,
+            asset_class="us_option", option_type="put",
+            expiration=date.today() + timedelta(days=40),
+        )
+
+    legs = [{"symbol": "SHORT", "action": "sell", "ratio": 1},
+            {"symbol": "LONG", "action": "buy", "ratio": 1}]
+    record = {"credit": "1.50", "contracts": "1", "status": "open", "legs": json.dumps(legs)}
+
+    # The short leg alone has more than halved — but the spread has not.
+    positions = {"SHORT": leg("SHORT", -1, 1.00), "LONG": leg("LONG", 1, 0.10)}
+    assert approx(bot._close_cost(legs, positions), 0.90)
+    assert bot._trade_exit_decision(record, positions) is None
+
+    # Now the spread itself is worth half what it was sold for.
+    positions["LONG"] = leg("LONG", 1, 0.25)
+    positions["SHORT"] = leg("SHORT", -1, 1.00)
+    assert bot._trade_exit_decision(record, positions)[0] == "profit_target"
+
+
+def test_every_strategy_has_a_config_file_with_valid_parameters() -> None:
+    """Each strategy ships a config, and every value in it survives the gate."""
+    import config as cfgmod
+    import strategies as lib
+
+    baseline = cfgmod.Settings().mutable_values()
+    for definition in lib.REGISTRY.values():
+        path = definition.config_path
+        assert path.exists(), f"{definition.key} has no config file — run strategies.py --write-configs"
+        params = cfgmod.StrategyConfigFile(path).parameters()
+        accepted, rejected = cfgmod.vet_changes(baseline, params)
+        assert not rejected, f"{definition.key}.json contains refused values: {rejected}"
+        assert accepted, f"{definition.key}.json set nothing"
+
+
+def test_switching_strategy_is_not_something_the_agent_can_do() -> None:
+    """Payoff geometry, capital and approval level all change — operator only."""
+    import config as cfgmod
+
+    assert "strategy" not in cfgmod.HERMES_BOUNDS
+    store, settings = _config_file({"strategy": "iron_butterfly"}, "switch")
+    before = settings.strategy
+    settings.apply_overlay(store)
+    assert settings.strategy == before
+    assert "strategy" in settings.overlay_rejected
 
 
 # ======================================================================================

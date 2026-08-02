@@ -752,6 +752,70 @@ class IBKRClient(BrokerClient):
         )
         return _trade_to_dict(trade, short_symbol)
 
+    def submit_combo(
+        self,
+        legs: Sequence[dict],
+        qty: int,
+        limit_price: Optional[float] = None,
+        *,
+        opening: bool = True,
+        client_order_id: Optional[str] = None,
+    ) -> dict:
+        """An arbitrary N-leg structure as one IBKR BAG contract.
+
+        ``legs`` always describe the position **as it will be held** — the
+        opening orientation — and the parent order's action expresses direction.
+        That is IB's own idiom for combos, and mixing the two conventions
+        (flipped legs *and* a flipped parent action) silently doubles the flip
+        and sends the opposite trade.
+
+        ``limit_price`` is this order's **signed net cashflow**: positive when
+        the order pays us, negative when we pay. An order that pays us is a SELL
+        of the bag; one we pay for is a BUY. Closing a credit structure
+        therefore costs money, resolves to BUY, and buys back exactly what was
+        sold. ``opening`` is accepted for interface symmetry with the Alpaca
+        client, which needs it to set per-leg intent.
+        """
+        from ib_async import Contract, ComboLeg, LimitOrder, MarketOrder
+
+        if not 2 <= len(legs) <= 4:
+            raise BrokerError(f"combo orders take 2–4 legs, got {len(legs)}")
+        self._require_ib()
+
+        combo_legs = [
+            ComboLeg(
+                conId=self._option_contract(leg["symbol"]).conId,
+                ratio=int(leg.get("ratio", 1)),
+                action="SELL" if leg["action"] == "sell" else "BUY",
+                exchange="SMART",
+            )
+            for leg in legs
+        ]
+
+        parts = occ_to_parts(legs[0]["symbol"])
+        bag = Contract(
+            secType="BAG", symbol=parts["underlying"], exchange="SMART",
+            currency="USD", comboLegs=combo_legs,
+        )
+        quantity = abs(int(qty))
+        net = float(limit_price) if limit_price is not None else 0.0
+        action = "SELL" if net >= 0 else "BUY"
+        order = (
+            LimitOrder(action, quantity, round(abs(net), 2))
+            if limit_price is not None
+            else MarketOrder("SELL" if opening else "BUY", quantity)
+        )
+        order.tif = "DAY"
+        if client_order_id:
+            order.orderRef = client_order_id[:32]
+
+        trade = self._guard(
+            f"placeCombo:{legs[0]['symbol']}",
+            lambda: self._run(self._place_async(bag, order)),
+            retries=0,
+        )
+        return _trade_to_dict(trade, legs[0]["symbol"])
+
     def close_position(self, symbol: str, qty: Optional[int] = None) -> dict:
         """Flatten at market — the stop and emergency path."""
         from ib_async import MarketOrder

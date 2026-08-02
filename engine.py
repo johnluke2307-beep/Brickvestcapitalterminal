@@ -549,8 +549,17 @@ TRADE_FIELDS = [
     "entry_iv",
     "entry_rv",
     "entry_iv_rank",
-    "credit",          # per-contract credit received, in dollars
-    "exit_debit",      # per-contract debit paid to close
+    # Signed net premium per contract: positive when the structure was sold for
+    # a credit, negative when it was bought for a debit. The column keeps its
+    # original name so logs written before the strategy library still load.
+    "credit",
+    "exit_debit",      # per-contract net cost to close
+    # JSON list of ``{"symbol", "action", "ratio"}``. The whole reason a condor
+    # can be managed as one trade rather than four unrelated positions — without
+    # it, the exit logic cannot tell a long wing from a naked short.
+    "legs",
+    "capital_required",
+    "max_loss",
     "pnl_usd",
     "pnl_zar",
     "usd_zar",
@@ -575,6 +584,28 @@ class TradeLog:
         if not self.path.exists():
             with self.path.open("w", newline="") as handle:
                 csv.DictWriter(handle, fieldnames=TRADE_FIELDS).writeheader()
+        else:
+            self._migrate_header()
+
+    def _migrate_header(self) -> None:
+        """Rewrite an older log in the current schema, preserving every row.
+
+        Appending new-schema rows to a file with an old header silently shifts
+        every column after the first new one, which corrupts the P&L record
+        rather than failing. Migrating on open is cheap and the file is small.
+        """
+        try:
+            with self.path.open(newline="") as handle:
+                reader = csv.DictReader(handle)
+                if reader.fieldnames == TRADE_FIELDS:
+                    return
+                rows = list(reader)
+        except OSError:
+            return
+        with self.path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=TRADE_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows({key: row.get(key, "") for key in TRADE_FIELDS} for row in rows)
 
     # ------------------------------------------------------------------ writes
     def append(self, record: dict) -> None:

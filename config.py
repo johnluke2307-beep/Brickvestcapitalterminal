@@ -4,7 +4,7 @@ Brickvestcapitalterminal — central configuration.
 Every tunable lives here so the strategy can be audited in one place. Values are
 resolved with the following precedence:
 
-    1. ``strategy_config.json``         (the agent-writable overlay — see below)
+    1. ``strategies/<strategy>.json``   (the agent-writable overlay — see below)
     2. Environment variables            (best for Hugging Face Spaces / Docker)
     3. ``st.secrets``                   (best for Streamlit Community Cloud)
     4. The defaults declared below      (safe, paper-trading oriented)
@@ -18,9 +18,14 @@ The research layer (Hermes) never calls into the execution layer. It writes a
 JSON file; the execution loop reads it. That file is the *entire* interface, and
 this module is where it is policed:
 
-* Only keys in :data:`HERMES_BOUNDS` are read. A ``broker``, ``paper`` or
-  ``alpaca_api_key`` entry in the file is ignored, not applied — promoting to
-  live money is not expressible in the agent's vocabulary.
+There is one such file per strategy — ``strategies/iron_condor.json``,
+``strategies/cash_secured_put.json`` and so on — and the active one is chosen by
+``BVC_STRATEGY``, which is itself *not* agent-writable.
+
+* Only keys in :data:`HERMES_BOUNDS` are read. A ``broker``, ``paper``,
+  ``strategy`` or ``alpaca_api_key`` entry in the file is ignored, not applied —
+  neither promoting to live money nor switching strategy is expressible in the
+  agent's vocabulary.
 * Every value must sit inside its declared bound.
 * **Risk limits ratchet.** The overlay may only move a ``risk_limit`` parameter
   in the safer direction *relative to the operator's own env/default baseline*.
@@ -56,10 +61,31 @@ FX_CACHE_PATH = STATE_DIR / "fx_cache.json"
 #: so a process that must never import the broker layer can still write it.
 HALT_REQUEST_PATH = STATE_DIR / "halt_request.json"
 
-#: The Hermes ↔ engine contract. Lives at the repo root rather than under
-#: ``state/`` because it is a reviewable artifact: you should be able to read
-#: the diff of what the agent changed about your strategy.
-STRATEGY_CONFIG_PATH = Path(os.getenv("BVC_STRATEGY_CONFIG", ROOT_DIR / "strategy_config.json"))
+#: The Hermes ↔ engine contract: one config file per strategy, versioned in the
+#: repo rather than hidden under ``state/``, because it is a reviewable artifact.
+#: You should be able to read the diff of what the agent changed about your
+#: strategy. Switching strategies switches a whole coherent parameter set — a
+#: 20-delta condor and a 30-delta cash-secured put are not the same trade with a
+#: different leg count, and must not share tuning.
+STRATEGIES_DIR = Path(os.getenv("BVC_STRATEGIES_DIR", ROOT_DIR / "strategies"))
+#: Fallback for a strategy with no file of its own, and for single-strategy
+#: deployments that would rather keep one file at the root.
+STRATEGY_CONFIG_PATH = Path(ROOT_DIR / "strategy_config.json")
+
+
+def strategy_config_path(strategy: str) -> Path:
+    """Where the active strategy's parameters live.
+
+    ``BVC_STRATEGY_CONFIG`` wins when set (tests and single-file deployments).
+    Otherwise the per-strategy file, falling back to a shared root file so an
+    install that predates the strategy library keeps working untouched.
+    """
+    explicit = os.getenv("BVC_STRATEGY_CONFIG")
+    if explicit:
+        return Path(explicit)
+    candidate = STRATEGIES_DIR / f"{strategy}.json"
+    return candidate if candidate.exists() else STRATEGY_CONFIG_PATH
+
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -172,6 +198,10 @@ HERMES_BOUNDS: Dict[str, Bound] = {
     "time_exit_dte": Bound(0, 30, "higher", note="exiting earlier reduces gamma risk"),
     "min_credit_usd": Bound(0.10, 5.00, "higher"),
     "max_spread_pct": Bound(0.02, 0.50, "lower"),
+    # ---- multi-leg shape, used only by the strategies that have those legs --
+    "spread_width": Bound(1.0, 50.0, "lower", note="a narrower wing caps the defined loss"),
+    "long_leg_delta": Bound(0.60, 0.95, "higher", note="deeper long leg tracks the stock more closely"),
+    "back_month_dte": Bound(60, 240),
 
     # ---- risk limits: ratcheted. Tighten only. -----------------------------
     "max_margin_utilization": Bound(0.05, 0.50, "lower", risk_limit=True,
@@ -343,10 +373,19 @@ class Settings:
     min_iv_rank: float = field(default_factory=lambda: _float("BVC_MIN_IV_RANK", 50.0))
     #: Minimum IV − RV spread (annualised vol points) required to call it an edge.
     min_vrp: float = field(default_factory=lambda: _float("BVC_MIN_VRP", 0.02))
-    #: "short_put" (cash-secured put, options level 2) or "put_credit_spread" (level 3).
-    strategy: str = field(default_factory=lambda: str(setting("BVC_STRATEGY", "short_put")).lower())
-    #: Width in strikes-dollars for the long wing of a credit spread.
+    #: Which strategy from the library to run — see ``strategies.REGISTRY``.
+    #: Deliberately *not* agent-mutable. Switching strategy changes the payoff
+    #: geometry, the capital requirement and the options approval level needed;
+    #: it is an operator decision. Hermes can recommend a switch in its report,
+    #: and can compare strategies in the backtester, but cannot make one.
+    strategy: str = field(default_factory=lambda: str(setting("BVC_STRATEGY", "cash_secured_put")).lower())
+    #: Width in strikes-dollars for the long wing of a spread, condor or fly.
     spread_width: float = field(default_factory=lambda: _float("BVC_SPREAD_WIDTH", 5.0))
+    #: Delta of the long back-month leg in a diagonal (PMCC). Deep enough that
+    #: the leg behaves like stock; 0.80 is the usual floor.
+    long_leg_delta: float = field(default_factory=lambda: _float("BVC_LONG_LEG_DELTA", 0.80))
+    #: Target DTE for the back month of a calendar or diagonal.
+    back_month_dte: int = field(default_factory=lambda: _int("BVC_BACK_MONTH_DTE", 105))
 
     # ---------------------------------------------------------------- exit management
     #: Buy back at 50% of the credit received — the classic VRP profit taker.
@@ -427,6 +466,10 @@ class Settings:
         values.update(self.overlay_baseline)
         return values
 
+    def config_store(self) -> StrategyConfigFile:
+        """The parameter file for whichever strategy is active."""
+        return StrategyConfigFile(strategy_config_path(self.strategy))
+
     def apply_overlay(self, source: StrategyConfigFile | None = None) -> "Settings":
         """Fold ``strategy_config.json`` in on top of the operator's baseline.
 
@@ -434,7 +477,7 @@ class Settings:
         ratchet always compares against what the human configured — repeated
         reloads can never walk a risk limit outward one small step at a time.
         """
-        source = source or STRATEGY_CONFIG
+        source = source or self.config_store()
         document = source.read()
         requested = document.get("parameters")
         baseline = self.baseline_values()

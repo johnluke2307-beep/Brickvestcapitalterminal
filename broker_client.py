@@ -708,6 +708,67 @@ class BrokerClient:
         order = self._guard("submit_mleg_order", lambda: client.submit_order(request), retries=1)
         return _order_to_dict(order)
 
+    def submit_combo(
+        self,
+        legs: Sequence[dict],
+        qty: int,
+        limit_price: Optional[float] = None,
+        *,
+        opening: bool = True,
+        client_order_id: Optional[str] = None,
+    ) -> dict:
+        """Send an arbitrary N-leg structure as one order.
+
+        ``legs`` is a list of ``{"symbol": …, "action": "sell"|"buy", "ratio": 1}``
+        describing the position **as it will be held**; ``opening=False`` flips
+        every leg to close it. A condor legged in one contract at a time is a
+        different trade from a condor — the market moves between fills and the
+        credit you modelled is not the credit you get. Every multi-leg strategy
+        in the library goes through here so all legs price as a unit.
+
+        ``limit_price`` is this order's **signed net cashflow**: positive when
+        the order pays us, negative when we pay. Each venue's own sign
+        convention is applied here rather than leaked to the caller.
+        """
+        from alpaca.trading.enums import OrderClass, OrderSide, PositionIntent, TimeInForce
+        from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest, OptionLegRequest
+
+        if not 2 <= len(legs) <= 4:
+            raise BrokerError(f"multi-leg orders take 2–4 legs, got {len(legs)}")
+        client = self._require(self._trading, "trading")
+
+        requests = []
+        for leg in legs:
+            selling = (leg["action"] == "sell") == opening
+            requests.append(
+                OptionLegRequest(
+                    symbol=leg["symbol"],
+                    ratio_qty=int(leg.get("ratio", 1)),
+                    side=OrderSide.SELL if selling else OrderSide.BUY,
+                    position_intent=(
+                        (PositionIntent.SELL_TO_OPEN if selling else PositionIntent.BUY_TO_OPEN)
+                        if opening
+                        else (PositionIntent.SELL_TO_CLOSE if selling else PositionIntent.BUY_TO_CLOSE)
+                    ),
+                )
+            )
+
+        common = dict(
+            qty=abs(int(qty)),
+            order_class=OrderClass.MLEG,
+            time_in_force=TimeInForce.DAY,
+            legs=requests,
+            client_order_id=client_order_id,
+        )
+        if limit_price is not None:
+            # Alpaca prices a multi-leg net credit as a negative limit.
+            request = LimitOrderRequest(limit_price=round(-float(limit_price), 2), **common)
+        else:
+            request = MarketOrderRequest(**common)
+
+        order = self._guard("submit_combo", lambda: client.submit_order(request), retries=1)
+        return _order_to_dict(order)
+
     def close_position(self, symbol: str, qty: Optional[int] = None) -> dict:
         """Flatten a position at market — the emergency and time-exit path."""
         from alpaca.trading.requests import ClosePositionRequest

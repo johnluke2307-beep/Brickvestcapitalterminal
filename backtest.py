@@ -7,10 +7,19 @@ DTE and delta when volatility is rich, take profit at 50% of the credit, stop at
 ``engine.py`` for pricing, volatility and expectancy, so a backtest and a live
 cycle are scored by the same code rather than two implementations that drift.
 
-Three strategies, all short premium:
-    short_put          cash-secured put (options level 2) — the live default
-    put_credit_spread  defined-risk vertical (level 3)
-    iron_condor        both wings (level 3)
+Strategies come from ``strategies.py`` — the same library the live bot trades,
+so a comparison here is a comparison of the things that would actually run:
+
+    cash_secured_put     the live default (options level 2)
+    covered_call         against stock you already hold (level 1)
+    put_credit_spread    defined-risk vertical (level 3)
+    call_credit_spread   the same, on the upside
+    iron_condor          both tails sold and bought back
+    iron_butterfly       shorts collapsed to the money
+
+Calendars and diagonals are in the library but not replayable here: this model
+prices one expiry per trade, and a two-expiry structure would come out quietly
+wrong. Asking for one raises rather than approximates.
 
 The volatility assumption is the whole ballgame
 -----------------------------------------------
@@ -49,6 +58,7 @@ if TYPE_CHECKING:  # annotations only — pandas is imported lazily at call site
 
 import config
 import engine
+import strategies
 
 OPTION_MULTIPLIER = 100
 TRADING_DAYS = 252
@@ -78,7 +88,9 @@ class BacktestConfig:
     #: Mirrors the live margin guardrail: total collateral vs NAV.
     max_margin_utilization: float = 0.50
 
-    strategy: str = "short_put"  # short_put | put_credit_spread | iron_condor
+    #: Any key from ``strategies.REGISTRY`` that this replay can price — see
+    #: :data:`ALL_STRATEGIES`. ``short_put`` is accepted as a legacy alias.
+    strategy: str = "cash_secured_put"
     dte_entry: int = 45
     dte_exit: int = 21
     short_delta: float = 0.30
@@ -110,7 +122,7 @@ class BacktestConfig:
         s = settings or config.load_settings()
         return cls(
             symbols=list(s.universe[:4]),
-            strategy=s.strategy if s.strategy in {"short_put", "put_credit_spread"} else "short_put",
+            strategy=_canonical_strategy(s.strategy),
             dte_entry=s.target_dte,
             dte_exit=s.time_exit_dte,
             short_delta=abs(s.target_delta),
@@ -324,45 +336,96 @@ class Backtester:
         return round(strike / step) * step if step > 0 else strike
 
     def _build_legs(self, spot: float, t: float, iv: float) -> Optional[tuple[List[Leg], float]]:
-        """Strikes for the configured structure, plus the collateral per contract."""
+        """Strikes for the configured structure, plus the collateral per contract.
+
+        Mirrors ``strategies.py`` leg for leg, with one deliberate difference:
+        strikes come from an inverse-delta solve on the modelled surface rather
+        than from a listed chain, because there is no chain in a replay. Every
+        structure here is single-expiry — the calendar and diagonal are refused
+        up front rather than approximated, since this replay prices one expiry
+        per trade and a two-expiry structure would come out quietly wrong.
+        """
         cfg = self.cfg
         rate = cfg.risk_free_rate
+        strategy = _canonical_strategy(cfg.strategy)
 
-        short_put = self._round_strike(
-            engine.strike_from_delta(spot, t, iv, rate, -cfg.short_delta, is_call=False)
-        )
-        if short_put >= spot:  # a short put must sit below spot
-            return None
+        if strategy in TWO_EXPIRY_STRATEGIES:
+            raise ValueError(
+                f"{strategy} needs two expiries; this backtester models one expiry per "
+                "trade. Compare it live, or extend Backtester to carry a back month."
+            )
 
-        if cfg.strategy == "short_put":
+        def put_at(delta: float) -> float:
+            return self._round_strike(
+                engine.strike_from_delta(spot, t, iv, rate, -abs(delta), is_call=False)
+            )
+
+        def call_at(delta: float) -> float:
+            return self._round_strike(
+                engine.strike_from_delta(spot, t, iv, rate, abs(delta), is_call=True)
+            )
+
+        # ---- single-leg -----------------------------------------------------
+        if strategy == "cash_secured_put":
+            short_put = put_at(cfg.short_delta)
+            if short_put >= spot:
+                return None
             # Cash-secured: the collateral is the full strike notional.
             return [Leg(short_put, False, -1)], short_put * OPTION_MULTIPLIER
 
-        long_put = self._round_strike(
-            engine.strike_from_delta(spot, t, iv, rate, -cfg.long_delta, is_call=False)
-        )
-        long_put = min(long_put, short_put - cfg.strike_increment)
-        if long_put <= 0:
-            return None
-        put_width = short_put - long_put
-        legs = [Leg(short_put, False, -1), Leg(long_put, False, 1)]
+        if strategy == "covered_call":
+            short_call = call_at(cfg.short_delta)
+            if short_call <= spot:
+                return None
+            # The capital is the 100 shares standing behind it, not the option.
+            return [Leg(short_call, True, -1)], spot * OPTION_MULTIPLIER
 
-        if cfg.strategy == "put_credit_spread":
-            return legs, put_width * OPTION_MULTIPLIER
+        # ---- verticals ------------------------------------------------------
+        if strategy == "put_credit_spread":
+            short_put = put_at(cfg.short_delta)
+            long_put = min(put_at(cfg.long_delta), short_put - cfg.strike_increment)
+            if short_put >= spot or long_put <= 0:
+                return None
+            return (
+                [Leg(short_put, False, -1), Leg(long_put, False, 1)],
+                (short_put - long_put) * OPTION_MULTIPLIER,
+            )
 
-        # Iron condor — add the call side.
-        short_call = self._round_strike(
-            engine.strike_from_delta(spot, t, iv, rate, cfg.short_delta, is_call=True)
-        )
-        long_call = self._round_strike(
-            engine.strike_from_delta(spot, t, iv, rate, cfg.long_delta, is_call=True)
-        )
-        short_call = max(short_call, spot + cfg.strike_increment)
-        long_call = max(long_call, short_call + cfg.strike_increment)
-        call_width = long_call - short_call
-        legs += [Leg(short_call, True, -1), Leg(long_call, True, 1)]
-        # Only one side can lose at expiry, so margin is the wider wing.
-        return legs, max(put_width, call_width) * OPTION_MULTIPLIER
+        if strategy == "call_credit_spread":
+            short_call = call_at(cfg.short_delta)
+            long_call = max(call_at(cfg.long_delta), short_call + cfg.strike_increment)
+            if short_call <= spot:
+                return None
+            return (
+                [Leg(short_call, True, -1), Leg(long_call, True, 1)],
+                (long_call - short_call) * OPTION_MULTIPLIER,
+            )
+
+        # ---- four-leg -------------------------------------------------------
+        if strategy == "iron_butterfly":
+            body = self._round_strike(spot)
+            wing = max(cfg.strike_increment, body - put_at(cfg.long_delta))
+            legs = [
+                Leg(body, False, -1), Leg(body - wing, False, 1),
+                Leg(body, True, -1), Leg(body + wing, True, 1),
+            ]
+            return legs, wing * OPTION_MULTIPLIER
+
+        if strategy == "iron_condor":
+            short_put = put_at(cfg.short_delta)
+            long_put = min(put_at(cfg.long_delta), short_put - cfg.strike_increment)
+            short_call = max(call_at(cfg.short_delta), spot + cfg.strike_increment)
+            long_call = max(call_at(cfg.long_delta), short_call + cfg.strike_increment)
+            if short_put >= spot or long_put <= 0:
+                return None
+            legs = [
+                Leg(short_put, False, -1), Leg(long_put, False, 1),
+                Leg(short_call, True, -1), Leg(long_call, True, 1),
+            ]
+            # Only one side can lose at expiry, so margin is the wider wing.
+            return legs, max(short_put - long_put, long_call - short_call) * OPTION_MULTIPLIER
+
+        raise ValueError(f"unknown strategy {cfg.strategy!r}; available: {', '.join(ALL_STRATEGIES)}")
 
     # --------------------------------------------------------------------- loop
     def run(self) -> BacktestResult:
@@ -822,7 +885,20 @@ def plateau_score(rows: List[dict], chosen: float, metric: str = "total_return")
             "share_positive": positive}
 
 
-ALL_STRATEGIES = ("short_put", "put_credit_spread", "iron_condor")
+#: Two-expiry structures. The replay prices one expiry per trade, so these are
+#: refused rather than approximated — see :meth:`Backtester._build_legs`.
+TWO_EXPIRY_STRATEGIES = ("calendar_spread", "diagonal_spread")
+
+#: Everything this backtester can replay, in the same order as the library.
+ALL_STRATEGIES = tuple(k for k in strategies.STRATEGY_KEYS if k not in TWO_EXPIRY_STRATEGIES)
+
+#: ``short_put`` was the original name for the cash-secured put. Old configs,
+#: saved comparisons and the CLI keep working.
+STRATEGY_ALIASES = {"short_put": "cash_secured_put"}
+
+
+def _canonical_strategy(name: str) -> str:
+    return STRATEGY_ALIASES.get(name, name)
 
 
 def compare_strategies(
@@ -878,7 +954,7 @@ def main() -> int:
     parser.add_argument("--symbols", default=None, help="comma-separated, e.g. SPY,QQQ")
     parser.add_argument("--start", default=None)
     parser.add_argument("--end", default=None)
-    parser.add_argument("--strategy", default=None, choices=["short_put", "put_credit_spread", "iron_condor"])
+    parser.add_argument("--strategy", default=None, choices=list(ALL_STRATEGIES) + ["short_put"])
     parser.add_argument("--vrp", type=float, default=None, help="vol points of premium (0 = null hypothesis)")
     parser.add_argument("--delta", type=float, default=None)
     parser.add_argument("--capital", type=float, default=None, help="starting capital in USD")
