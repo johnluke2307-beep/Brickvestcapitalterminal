@@ -610,6 +610,15 @@ class TradingBot:
         try:
             if not self.client.is_market_open():
                 blockers.append("market closed")
+            elif settings.entry_window_enabled:
+                elapsed = self.client.minutes_since_open()
+                if elapsed is None:
+                    blockers.append("session bounds unavailable")
+                elif not (settings.entry_window_start_min <= elapsed <= settings.entry_window_end_min):
+                    blockers.append(
+                        f"outside the entry window — {elapsed:.0f} min after the open, "
+                        f"window is {settings.entry_window_start_min}–{settings.entry_window_end_min} min"
+                    )
         except BrokerError as exc:
             blockers.append(f"clock unavailable: {exc}")
 

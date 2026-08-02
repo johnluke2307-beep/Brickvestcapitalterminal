@@ -97,6 +97,12 @@ class BacktestConfig:
     strike_increment: float = 1.0
     #: One open position per underlying at a time, as the live bot enforces.
     one_position_per_underlying: bool = True
+    #: Intraday entry window, in minutes after the opening bell. Carried so the
+    #: backtest and the live bot share one config shape — but see the warning
+    #: raised in :meth:`Backtester.run`: daily bars cannot honour it.
+    entry_window_enabled: bool = False
+    entry_window_start_min: int = 30
+    entry_window_end_min: int = 120
 
     @classmethod
     def from_settings(cls, settings: Optional[config.Settings] = None) -> "BacktestConfig":
@@ -114,6 +120,9 @@ class BacktestConfig:
             risk_free_rate=s.risk_free_rate,
             max_margin_utilization=s.max_margin_utilization,
             one_position_per_underlying=s.one_position_per_underlying,
+            entry_window_enabled=s.entry_window_enabled,
+            entry_window_start_min=s.entry_window_start_min,
+            entry_window_end_min=s.entry_window_end_min,
         )
 
 
@@ -561,6 +570,13 @@ class Backtester:
                     "No trades were taken — the vol-rank filter never passed. Lower the threshold "
                     "or widen the date range."
                 )
+        if self.cfg.entry_window_enabled:
+            self.warnings.append(
+                f"Entry window {self.cfg.entry_window_start_min}–{self.cfg.entry_window_end_min} min "
+                "after the open was NOT applied: this replay uses daily bars, which carry one price "
+                "per day and no intraday timestamps. The window is enforced live by the bot; free "
+                "intraday history only reaches back ~60 days, far short of one 45-DTE cycle."
+            )
         if self.cfg.vrp_points == 0:
             self.warnings.append(
                 "vrp_points = 0: options are priced at realised vol, so no variance risk premium exists "
@@ -623,6 +639,54 @@ def run_backtest(cfg: BacktestConfig, broker=None) -> BacktestResult:
     return result
 
 
+ALL_STRATEGIES = ("short_put", "put_credit_spread", "iron_condor")
+
+
+def compare_strategies(
+    cfg: BacktestConfig,
+    prices: Dict[str, "pd.DataFrame"],
+    strategies: Sequence[str] = ALL_STRATEGIES,
+) -> Dict[str, BacktestResult]:
+    """Replay several structures over the same history and capital.
+
+    One price set, one starting balance, one rule set — only the structure
+    changes, so the comparison isolates the thing being compared. Running them
+    separately with different downloads would not.
+    """
+    from dataclasses import replace as _replace
+
+    results: Dict[str, BacktestResult] = {}
+    for name in strategies:
+        results[name] = Backtester(_replace(cfg, strategy=name), prices).run()
+    return results
+
+
+def comparison_table(results: Dict[str, BacktestResult]) -> List[dict]:
+    """Flatten a comparison into rows, ranked by return on capital."""
+    rows = []
+    for name, result in results.items():
+        m = result.metrics
+        if not m:
+            continue
+        rows.append(
+            {
+                "strategy": name,
+                "total_return": m["total_return"],
+                "cagr": m["cagr"],
+                "sharpe": m["sharpe"],
+                "max_drawdown": m["max_drawdown"],
+                "calmar": m["calmar"],
+                "trades": m["trades"],
+                "win_rate": m["win_rate"],
+                "expectancy": m["expectancy"],
+                "final_nav": m["final_nav"],
+                "blocked": bool(result.warnings and m["trades"] == 0),
+            }
+        )
+    rows.sort(key=lambda r: r["total_return"], reverse=True)
+    return rows
+
+
 def main() -> int:
     """CLI: python backtest.py — runs the live configuration over history."""
     import argparse
@@ -634,6 +698,8 @@ def main() -> int:
     parser.add_argument("--strategy", default=None, choices=["short_put", "put_credit_spread", "iron_condor"])
     parser.add_argument("--vrp", type=float, default=None, help="vol points of premium (0 = null hypothesis)")
     parser.add_argument("--delta", type=float, default=None)
+    parser.add_argument("--capital", type=float, default=None, help="starting capital in USD")
+    parser.add_argument("--compare", action="store_true", help="run every strategy over the same history")
     args = parser.parse_args()
 
     cfg = BacktestConfig.from_settings()
@@ -649,6 +715,25 @@ def main() -> int:
         cfg.vrp_points = args.vrp
     if args.delta is not None:
         cfg.short_delta = args.delta
+    if args.capital is not None:
+        cfg.initial_capital = args.capital
+
+    if args.compare:
+        prices = load_history(cfg.symbols, cfg.start_date, cfg.end_date)
+        results = compare_strategies(cfg, prices)
+        print(f"{cfg.start_date} → {cfg.end_date} · ${cfg.initial_capital:,.0f} · "
+              f"IV = RV + {cfg.vrp_points * 100:.1f}pts\n")
+        header = f"{'STRATEGY':<20}{'RETURN':>9}{'CAGR':>8}{'SHARPE':>8}{'MAXDD':>8}{'TRADES':>8}{'WIN':>7}{'E/TRADE':>10}"
+        print(header)
+        print("-" * len(header))
+        for row in comparison_table(results):
+            print(f"{row['strategy']:<20}{row['total_return'] * 100:>8.1f}%{row['cagr'] * 100:>7.1f}%"
+                  f"{row['sharpe']:>8.2f}{row['max_drawdown'] * 100:>7.1f}%{row['trades']:>8d}"
+                  f"{row['win_rate'] * 100:>6.0f}%{row['expectancy']:>10,.0f}")
+        for name, result in results.items():
+            for note in result.warnings:
+                print(f"\n! {name}: {note}")
+        return 0
 
     print(f"Replaying {cfg.strategy} on {', '.join(cfg.symbols)} — {cfg.start_date} to {cfg.end_date}")
     print(f"IV surface = RV + {cfg.vrp_points * 100:.1f} vol points\n")

@@ -536,6 +536,104 @@ def test_yfinance_frame_shapes_all_parse() -> None:
     assert bt._extract_symbol(level0, "NOTLISTED") is None
 
 
+def test_compare_strategies_shares_one_history() -> None:
+    """All structures replay over the same prices, capital and rules."""
+    import backtest as bt
+
+    prices = {"SPY": _synthetic_frame(seed=11), "QQQ": _synthetic_frame(seed=12, s0=200.0)}
+    cfg = bt.BacktestConfig(
+        symbols=["SPY", "QQQ"], start_date="2020-01-01", end_date="2022-01-01",
+        initial_capital=250_000.0, vrp_points=0.03,
+    )
+    results = bt.compare_strategies(cfg, prices)
+    assert set(results) == set(bt.ALL_STRATEGIES)
+    for name, result in results.items():
+        assert result.config.strategy == name
+        assert result.config.initial_capital == cfg.initial_capital
+        assert result.config.vrp_points == cfg.vrp_points
+
+    rows = bt.comparison_table(results)
+    assert len(rows) == 3
+    # Ranked by return, best first.
+    assert rows == sorted(rows, key=lambda r: r["total_return"], reverse=True)
+
+
+def test_capital_is_respected_end_to_end() -> None:
+    """Starting capital flows through sizing, NAV and the final result."""
+    import backtest as bt
+
+    prices = {"SPY": _synthetic_frame(seed=13)}
+    for capital in (50_000.0, 200_000.0):
+        cfg = bt.BacktestConfig(
+            symbols=["SPY"], start_date="2020-01-01", end_date="2022-01-01",
+            strategy="put_credit_spread", initial_capital=capital, vrp_points=0.03,
+        )
+        result = bt.Backtester(cfg, prices).run()
+        assert abs(result.nav.iloc[0] - capital) < capital * 0.05
+        assert result.metrics["final_nav"] > 0
+
+
+def test_entry_window_is_declared_unreplayable_on_daily_bars() -> None:
+    """The window is a live-bot rule; a daily-bar replay must say so, not fake it.
+
+    Silently accepting an intraday filter that cannot be applied would make the
+    backtest claim to test something it never tested.
+    """
+    import backtest as bt
+
+    prices = {"SPY": _synthetic_frame(seed=14)}
+    cfg = bt.BacktestConfig(
+        symbols=["SPY"], start_date="2020-01-01", end_date="2021-06-01",
+        strategy="put_credit_spread", entry_window_enabled=True,
+        entry_window_start_min=30, entry_window_end_min=120,
+    )
+    result = bt.Backtester(cfg, prices).run()
+    assert any("NOT applied" in w for w in result.warnings)
+    assert any("30" in w and "120" in w for w in result.warnings)
+
+    off = bt.Backtester(bt.BacktestConfig(
+        symbols=["SPY"], start_date="2020-01-01", end_date="2021-06-01",
+        strategy="put_credit_spread"), prices).run()
+    assert not any("NOT applied" in w for w in off.warnings)
+
+
+def test_entry_window_blocks_the_live_bot_outside_its_hours() -> None:
+    """The live path enforces the window against real session bounds."""
+    import config as cfgmod
+    from bot import TradingBot
+    from broker_client import AccountSnapshot, BrokerClient, ConnectionHealth
+
+    class Clocked(BrokerClient):
+        def __init__(self, settings, elapsed):
+            import threading
+            self.settings = settings
+            self.health = ConnectionHealth(connected=True, last_ok=datetime.now(timezone.utc))
+            self._lock = threading.RLock()
+            self._elapsed = elapsed
+
+        def connect(self): return True
+        @property
+        def is_connected(self): return True
+        def get_account(self):
+            return AccountSnapshot(equity=100_000.0, maintenance_margin=5_000.0,
+                                   options_buying_power=90_000.0)
+        def get_positions(self): return []
+        def get_option_positions(self): return []
+        def is_market_open(self): return True
+        def minutes_since_open(self): return self._elapsed
+
+    settings = cfgmod.load_settings()
+    settings.entry_window_enabled = True
+    settings.entry_window_start_min = 30
+    settings.entry_window_end_min = 120
+
+    for elapsed, blocked in ((5, True), (45, False), (200, True)):
+        bot = TradingBot(client=Clocked(settings, elapsed), settings=settings)
+        reasons = bot._entry_blockers(bot.client.get_account())
+        hit = any("entry window" in r for r in reasons)
+        assert hit is blocked, f"{elapsed} min -> {reasons}"
+
+
 # ======================================================================================
 # Runner
 # ======================================================================================

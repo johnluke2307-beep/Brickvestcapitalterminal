@@ -125,7 +125,26 @@ luck rather than edge. Always look at both.
 ```bash
 python backtest.py --strategy put_credit_spread --vrp 0.03
 python backtest.py --strategy put_credit_spread --vrp 0     # the null
+python backtest.py --compare --capital 250000               # every structure, side by side
 ```
+
+**Comparison mode** (`ALL — compare` in the tab, `--compare` on the CLI) replays
+every structure over one price set, one starting balance and one rule set, so
+only the structure differs. Return on capital is the honest yardstick: a
+cash-secured put posts the full strike as collateral, so it can look safe and
+still be the worst use of the money — on a $100k account it typically cannot size
+a single SPY contract at all, and says so instead of returning zeros.
+
+**Capital** is adjustable from $1,000 to $10m. It changes what is reachable, not
+just the scale of the result.
+
+**Intraday entry window.** The live bot can be restricted to a window measured in
+minutes after the opening bell (`BVC_ENTRY_WINDOW=true`,
+`BVC_ENTRY_WINDOW_START=30`, `BVC_ENTRY_WINDOW_END=120`), enforced against the
+exchange calendar so half-days and DST are handled. **The backtest cannot replay
+it** — daily bars carry one price per day and no intraday timestamps, and free
+intraday history reaches back about 60 days, well short of a single 45-DTE cycle.
+Enabling it prints that warning rather than silently ignoring the setting.
 
 It runs on a hosted Streamlit deployment with **no Alpaca keys** — history comes
 from yfinance, so the Backtest tab is usable before any secrets are set. A

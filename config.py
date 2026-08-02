@@ -148,6 +148,12 @@ class Settings:
     max_spread_pct: float = field(default_factory=lambda: _float("BVC_MAX_SPREAD_PCT", 0.20))
     #: Refuse to open anything if account equity drops below this floor.
     min_equity_usd: float = field(default_factory=lambda: _float("BVC_MIN_EQUITY_USD", 2000.0))
+    #: Restrict entries to a window measured in minutes after the opening bell.
+    #: The first half hour is the widest-spread, least-representative part of the
+    #: day; by two hours the morning volatility premium has largely decayed.
+    entry_window_enabled: bool = field(default_factory=lambda: _bool("BVC_ENTRY_WINDOW", False))
+    entry_window_start_min: int = field(default_factory=lambda: _int("BVC_ENTRY_WINDOW_START", 30))
+    entry_window_end_min: int = field(default_factory=lambda: _int("BVC_ENTRY_WINDOW_END", 120))
 
     # ---------------------------------------------------------------- income target
     #: The whole point of the terminal: R10,000 of realised premium per month.

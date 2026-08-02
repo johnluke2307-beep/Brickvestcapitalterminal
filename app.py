@@ -325,6 +325,16 @@ def get_bot() -> TradingBot:
     return TradingBot(client=client, settings=settings)
 
 
+def md_escape(text: str) -> str:
+    """Escape markdown that Streamlit would otherwise interpret.
+
+    Dollar figures are the live case: Streamlit reads ``$…$`` as LaTeX, so a
+    message like "needs $48,500 but the pool is $25,000" renders as italic maths
+    instead of the sentence. Engine and backtest messages are full of them.
+    """
+    return text.replace("$", "\\$")
+
+
 def fmt_usd(value: Optional[float], digits: int = 2) -> str:
     return "—" if value is None else f"${value:,.{digits}f}"
 
@@ -524,7 +534,7 @@ def render_deck_controls(bot: TradingBot) -> None:
                 st.session_state["scan_at"] = datetime.now(timezone.utc)
                 st.rerun()
             except BrokerError as exc:
-                st.error(f"SCAN FAILED — {exc}")
+                st.error(md_escape(f"SCAN FAILED — {exc}"))
 
     if running:
         if columns[1].button("■ STOP BOT", use_container_width=True, key="deck_stop"):
@@ -1127,7 +1137,7 @@ def render_bot_console(bot: TradingBot) -> None:
         st.caption(f"{result.started_at.strftime('%Y-%m-%d %H:%M:%S')} UTC — {result.summary()}")
         if result.blocked:
             for blocker in result.blocked:
-                st.write(f"• {blocker}")
+                st.write(f"• {md_escape(blocker)}")
         if result.entries:
             st.success(f"Opened: {', '.join(e.get('symbol', '?') for e in result.entries)}")
         if result.exits:
@@ -1142,7 +1152,7 @@ def render_bot_console(bot: TradingBot) -> None:
 
     icons = {"critical": "🔴", "error": "🟠", "info": "•"}
     for event in reversed(state.events[-60:]):
-        st.write(f"{icons.get(event['level'], '•')} `{event['ts']}` {event['message']}")
+        st.write(f"{icons.get(event['level'], '•')} `{event['ts']}` {md_escape(event['message'])}")
 
 
 # ======================================================================================
@@ -1180,10 +1190,12 @@ def render_backtest(bot: TradingBot) -> None:
     symbols = row1[0].multiselect("Symbols", universe, default=[s for s in defaults.symbols if s in universe][:2])
     start = row1[1].text_input("Start", defaults.start_date)
     end = row1[2].text_input("End", defaults.end_date)
+    strategy_options = ["ALL — compare", "short_put", "put_credit_spread", "iron_condor"]
     strategy = row1[3].selectbox(
-        "Strategy", ["short_put", "put_credit_spread", "iron_condor"],
-        index=["short_put", "put_credit_spread", "iron_condor"].index(defaults.strategy),
+        "Strategy", strategy_options,
+        index=strategy_options.index(defaults.strategy) if defaults.strategy in strategy_options else 1,
     )
+    compare_all = strategy == "ALL — compare"
 
     row2 = st.columns(4)
     short_delta = row2[0].slider("Short delta", 0.05, 0.45, float(defaults.short_delta), 0.01)
@@ -1194,8 +1206,24 @@ def render_backtest(bot: TradingBot) -> None:
     row3 = st.columns(4)
     profit_target = row3[0].slider("Profit target", 0.10, 0.90, float(defaults.profit_target), 0.05)
     stop_loss = row3[1].slider("Stop (× credit)", 0.5, 5.0, float(defaults.stop_loss), 0.25)
-    capital = row3[2].number_input("Capital ($)", 10_000, 5_000_000, int(defaults.initial_capital), 10_000)
+    capital = row3[2].number_input("Capital ($)", 1_000, 10_000_000, int(defaults.initial_capital), 1_000,
+                                   help="A cash-secured put ties up strike × 100 — roughly $50k on SPY. "
+                                        "Small accounts can only reach the defined-risk structures.")
     per_asset = row3[3].slider("Max per asset", 0.05, 0.50, float(defaults.max_allocation_per_asset), 0.05)
+
+    with st.expander("Intraday entry window (live bot)"):
+        win_cols = st.columns([1, 2, 2])
+        window_on = win_cols[0].checkbox("Enabled", value=defaults.entry_window_enabled)
+        win_start = win_cols[1].slider("Open trades from (min after bell)", 0, 240,
+                                       int(defaults.entry_window_start_min), 5)
+        win_end = win_cols[2].slider("…until (min after bell)", 0, 390,
+                                     int(defaults.entry_window_end_min), 5)
+        st.caption(
+            "Enforced by the live bot against the exchange calendar, so half-days and DST are handled. "
+            "**It cannot be replayed here** — this backtest runs on daily bars, which carry one price per "
+            "day and no intraday timestamps. Free intraday history reaches back about 60 days, well short "
+            "of a single 45-DTE cycle."
+        )
 
     # The assumption that decides whether this measures an edge or measures noise.
     row4 = st.columns([2, 2, 2])
@@ -1216,12 +1244,15 @@ def render_backtest(bot: TradingBot) -> None:
             st.error("Pick at least one symbol.")
             return
         cfg = bt.BacktestConfig(
-            symbols=symbols, start_date=start, end_date=end, strategy=strategy,
+            symbols=symbols, start_date=start, end_date=end,
+            strategy="short_put" if compare_all else strategy,
             short_delta=short_delta, dte_entry=dte_entry, dte_exit=dte_exit,
             vol_rank_threshold=vol_rank, profit_target=profit_target, stop_loss=stop_loss,
             initial_capital=float(capital), max_allocation_per_asset=per_asset,
             vrp_points=vrp_points, risk_free_rate=bot.settings.risk_free_rate,
             max_margin_utilization=bot.settings.max_margin_utilization,
+            entry_window_enabled=window_on,
+            entry_window_start_min=win_start, entry_window_end_min=win_end,
         )
         try:
             broker = bot.client if bot.client.is_connected else None
@@ -1229,17 +1260,26 @@ def render_backtest(bot: TradingBot) -> None:
                 prices = load_backtest_history(tuple(symbols), start, end, _broker=broker)
             missing = [s for s in symbols if s not in prices]
             with st.spinner("Replaying…"):
-                result = bt.Backtester(cfg, prices).run()
+                if compare_all:
+                    # One price set, one balance, one rule set — only the
+                    # structure differs, so the comparison isolates it.
+                    comparison = bt.compare_strategies(cfg, prices)
+                    st.session_state["bt_comparison"] = comparison
+                    result = max(comparison.values(), key=lambda r: r.metrics.get("total_return", -9))
+                    null = None
+                else:
+                    st.session_state["bt_comparison"] = None
+                    result = bt.Backtester(cfg, prices).run()
+                    null = None
+                    if compare_null and vrp_points > 0:
+                        # Same frames, same rules, no premium — the honest control.
+                        null = bt.Backtester(replace(cfg, vrp_points=0.0), prices).run()
                 if missing:
                     result.warnings.insert(0, f"No history for {', '.join(missing)} — excluded from the run.")
-                null = None
-                if compare_null and vrp_points > 0:
-                    # Same frames, same rules, no premium — the honest control.
-                    null = bt.Backtester(replace(cfg, vrp_points=0.0), prices).run()
             st.session_state["bt_result"] = result
             st.session_state["bt_null"] = null
         except Exception as exc:
-            st.error(f"BACKTEST FAILED — {exc}")
+            st.error(md_escape(f"BACKTEST FAILED — {exc}"))
             st.caption(
                 "History comes from yfinance, falling back to the broker feed. If this host blocks "
                 "outbound HTTP, neither is reachable."
@@ -1251,7 +1291,98 @@ def render_backtest(bot: TradingBot) -> None:
         st.info("Set the parameters above and press RUN BACKTEST.")
         return
 
+    comparison = st.session_state.get("bt_comparison")
+    if comparison:
+        render_strategy_comparison(comparison, bot)
+        st.divider()
     render_backtest_results(result, st.session_state.get("bt_null"), bot)
+
+
+def render_strategy_comparison(comparison: dict, bot: TradingBot) -> None:
+    """Every structure over the same history, ranked, with overlaid equity curves."""
+    import backtest as bt
+
+    palette = theme()
+    rows = bt.comparison_table(comparison)
+    if not rows:
+        st.info("No comparable results.")
+        return
+
+    st.markdown('<div class="bvc-panel-title"><span class="idx">A</span>Strategy comparison</div>',
+                unsafe_allow_html=True)
+
+    grid = "grid-template-columns:8.5rem 5rem 4.5rem 4.5rem 5rem 4rem 4rem 6rem;"
+    header = (
+        f'<div class="bvc-row bvc-head" style="{grid}">'
+        "<span>STRUCTURE</span><span style='text-align:right'>RETURN</span>"
+        "<span style='text-align:right'>CAGR</span><span style='text-align:right'>SHARPE</span>"
+        "<span style='text-align:right'>MAX DD</span><span style='text-align:right'>TRADES</span>"
+        "<span style='text-align:right'>WIN</span><span style='text-align:right'>E/TRADE</span></div>"
+    )
+    body = ""
+    for i, row in enumerate(rows):
+        rank_cls = "t-chrome" if i == 0 else "t-accent"
+        ret_cls = "t-good" if row["total_return"] >= 0 else "t-crit"
+        if row["trades"] == 0:
+            body += (
+                f'<div class="bvc-row" style="{grid}">'
+                f'<span class="{rank_cls}">{row["strategy"]}</span>'
+                f'<span class="t-idle" style="grid-column:span 7">no trades — see the note below</span></div>'
+            )
+            continue
+        body += (
+            f'<div class="bvc-row" style="{grid}">'
+            f'<span class="{rank_cls}">{row["strategy"]}</span>'
+            f'<span class="{ret_cls}" style="text-align:right">{row["total_return"] * 100:+.1f}%</span>'
+            f'<span style="text-align:right">{row["cagr"] * 100:.1f}%</span>'
+            f'<span style="text-align:right">{row["sharpe"]:.2f}</span>'
+            f'<span class="t-crit" style="text-align:right">{row["max_drawdown"] * 100:.1f}%</span>'
+            f'<span style="text-align:right">{row["trades"]}</span>'
+            f'<span style="text-align:right">{row["win_rate"] * 100:.0f}%</span>'
+            f'<span style="text-align:right">${row["expectancy"]:,.0f}</span></div>'
+        )
+    st.markdown(f'<div class="bvc-panel">{header}{body}</div>', unsafe_allow_html=True)
+
+    # Overlaid curves — same capital, same history, so the axis is shared and
+    # the comparison is direct. Colour follows the structure, not its rank.
+    series_colours = {
+        "short_put": palette["series_1"],
+        "put_credit_spread": palette["series_2"],
+        "iron_condor": "#199e70",
+    }
+    fig = go.Figure()
+    for name, result in comparison.items():
+        if result.nav.empty:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=result.nav.index, y=result.nav.values, mode="lines", name=name,
+                line=dict(color=series_colours.get(name, palette["muted"]), width=2),
+                hovertemplate="%{x|%Y-%m-%d}<br>$%{y:,.0f}<extra>" + name + "</extra>",
+            )
+        )
+    first = next(iter(comparison.values()))
+    fig.add_hline(
+        y=first.config.initial_capital,
+        line=dict(color=palette["muted"], width=1, dash="dot"),
+        annotation_text="Starting capital", annotation_position="bottom right",
+        annotation_font=dict(color=palette["muted"], size=11),
+    )
+    fig.update_layout(hovermode="x unified")
+    st.plotly_chart(style_figure(fig, height=360, showlegend=True),
+                    use_container_width=True, config={"displayModeBar": False})
+
+    notes = []
+    for name, result in comparison.items():
+        for note in result.warnings:
+            notes.append(f"**{name}** — {note}")
+    for note in notes[:6]:
+        st.caption(md_escape(note))
+    st.caption(
+        "Same prices, same starting capital, same rules — only the structure differs. Return on capital "
+        "is the honest comparison here: a cash-secured put posts the full strike as collateral, so it can "
+        "look safe and still be the worst use of the money."
+    )
 
 
 def render_backtest_results(result, null, bot: TradingBot) -> None:
@@ -1295,7 +1426,7 @@ def render_backtest_results(result, null, bot: TradingBot) -> None:
         )
 
     for note in result.warnings:
-        st.warning(note)
+        st.warning(md_escape(note))
 
     left, right = st.columns([3, 2])
     with left:

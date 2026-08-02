@@ -380,6 +380,44 @@ class BrokerClient:
         clock = self._guard("get_clock", client.get_clock)
         return bool(getattr(clock, "is_open", False))
 
+    def get_session_bounds(self, day: Optional[date] = None) -> Optional[tuple[datetime, datetime]]:
+        """Today's real open and close, in UTC, or ``None`` if it is not a session day.
+
+        Read from the exchange calendar rather than assumed to be 13:30–20:00
+        UTC: half-days close at 18:00 UTC, and the US/Eastern offset shifts
+        twice a year. An entry window measured from a guessed open would drift
+        by an hour for months at a time.
+        """
+        from zoneinfo import ZoneInfo
+
+        from alpaca.trading.requests import GetCalendarRequest
+
+        client = self._require(self._trading, "trading")
+        day = day or datetime.now(timezone.utc).date()
+        sessions = self._guard(
+            "get_calendar",
+            lambda: client.get_calendar(GetCalendarRequest(start=day, end=day)),
+        )
+        for session in sessions or []:
+            if getattr(session, "date", None) != day:
+                continue
+            eastern = ZoneInfo("America/New_York")
+            open_dt = datetime.combine(session.date, session.open, tzinfo=eastern)
+            close_dt = datetime.combine(session.date, session.close, tzinfo=eastern)
+            return open_dt.astimezone(timezone.utc), close_dt.astimezone(timezone.utc)
+        return None
+
+    def minutes_since_open(self) -> Optional[float]:
+        """Minutes elapsed since today's open, or ``None`` outside a session."""
+        bounds = self.get_session_bounds()
+        if not bounds:
+            return None
+        open_dt, close_dt = bounds
+        now = datetime.now(timezone.utc)
+        if not (open_dt <= now <= close_dt):
+            return None
+        return (now - open_dt).total_seconds() / 60.0
+
     def get_clock(self) -> dict:
         client = self._require(self._trading, "trading")
         clock = self._guard("get_clock", client.get_clock)
