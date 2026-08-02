@@ -55,13 +55,18 @@ THEMES = {
     # who wants to read it in daylight. Both were validated against their own
     # surface, so the series colours clear 3:1 and stay CVD-separable in each.
     "dark": {
-        "surface": "#0b0e13",
-        "panel": "#11151c",
-        "border": "#1e2632",
-        "text": "#dfe6ee",
-        "muted": "#7d8896",
-        "grid": "#1a212b",
-        "axis": "#2a3340",
+        "surface": "#05070a",
+        "panel": "#0a0d12",
+        "panel_alt": "#0d1117",     # zebra stripe
+        "border": "#1a2029",
+        "text": "#e8edf2",
+        "muted": "#78828f",
+        # Amber is the terminal's chrome voice — labels, rails, column heads.
+        # It never carries data, so it cannot be confused with a series colour.
+        "chrome": "#ffa028",
+        "chrome_dim": "#8a5a1b",
+        "grid": "#151b23",
+        "axis": "#232b36",
         "series_1": "#3987e5",  # blue   — implied volatility, income, equity
         "series_2": "#d95926",  # orange — realised volatility
         "series_1_fill": "rgba(57,135,229,0.16)",
@@ -74,9 +79,12 @@ THEMES = {
     "light": {
         "surface": "#fcfcfb",
         "panel": "#f4f4f1",
+        "panel_alt": "#efefeb",
         "border": "#e1e0d9",
         "text": "#0b0b0b",
         "muted": "#898781",
+        "chrome": "#8a5a1b",
+        "chrome_dim": "#b08a52",
         "grid": "#e1e0d9",
         "axis": "#c3c2b7",
         "series_1": "#2a78d6",
@@ -115,108 +123,141 @@ def inject_terminal_css() -> None:
     st.markdown(
         f"""
         <style>
-          /* Streamlit reads .streamlit/config.toml relative to the working
-             directory, so a run started from elsewhere would keep the light
-             chrome. These rules make the deck dark regardless of how it was
-             launched. */
+          /* ---- surface -------------------------------------------------
+             Streamlit resolves config.toml against the working directory, so a
+             run started elsewhere would keep light chrome. These rules hold the
+             terminal look however it was launched. */
           .stApp, [data-testid="stAppViewContainer"] {{ background: {p["surface"]}; }}
-          [data-testid="stHeader"] {{ background: transparent; }}
+          [data-testid="stHeader"] {{ background: transparent; height: 2.2rem; }}
+          .block-container {{ padding-top: 2.4rem !important; padding-bottom: 2rem; }}
           [data-testid="stSidebar"] {{
-              background: {p["panel"]};
-              border-right: 1px solid {p["border"]};
+              background: {p["panel"]}; border-right: 1px solid {p["border"]};
           }}
           [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2,
-          [data-testid="stSidebar"] h3, [data-testid="stSidebar"] p,
-          [data-testid="stSidebar"] label, [data-testid="stSidebar"] li {{
-              color: {p["text"]};
+          [data-testid="stSidebar"] p, [data-testid="stSidebar"] label,
+          [data-testid="stSidebar"] li {{ color: {p["text"]}; }}
+          [data-testid="stSidebar"] h3 {{
+              color: {p["chrome"]}; letter-spacing: .14em; text-transform: uppercase;
+              font-size: .8rem;
           }}
           [data-testid="stSidebar"] [data-testid="stCaptionContainer"],
           [data-testid="stSidebar"] small {{ color: {p["muted"]} !important; }}
-          /* Controls need their own colours — inheriting the text colour alone
-             leaves light-on-light buttons that cannot be read. */
+          [data-testid="stSidebar"] strong {{ color: {p["chrome"]}; }}
+
+          /* ---- controls: boxy, monospace, amber on hover ---------------- */
           .stButton > button, .stDownloadButton > button {{
-              background: {p["surface"]}; color: {p["text"]};
-              border: 1px solid {p["border"]}; font-family: {MONO};
-              font-size: .78rem; letter-spacing: .04em;
+              background: {p["panel"]}; color: {p["text"]};
+              border: 1px solid {p["border"]}; border-radius: 0;
+              font-family: {MONO}; font-size: .72rem;
+              letter-spacing: .1em; text-transform: uppercase; padding: .3rem .7rem;
           }}
           .stButton > button:hover, .stDownloadButton > button:hover {{
-              border-color: {p["series_1"]}; color: {p["series_1"]};
+              border-color: {p["chrome"]}; color: {p["chrome"]}; background: {p["panel_alt"]};
           }}
           .stButton > button:disabled {{ color: {p["muted"]}; border-color: {p["border"]}; }}
+          .stButton > button[kind="primary"] {{
+              background: {p["chrome"]}; color: {p["surface"]};
+              border-color: {p["chrome"]}; font-weight: 700;
+          }}
           [data-baseweb="select"] > div, [data-baseweb="input"] > div,
           [data-testid="stSelectbox"] div[role="combobox"],
-          [data-testid="stNumberInput"] input,
+          [data-testid="stNumberInput"] input, [data-testid="stTextInput"] input,
           [data-testid="stSelectbox"] div[data-baseweb="select"] div {{
-              background-color: {p["surface"]} !important;
+              background-color: {p["panel"]} !important;
               border-color: {p["border"]} !important;
               color: {p["text"]} !important;
+              border-radius: 0 !important; font-family: {MONO};
           }}
           [data-baseweb="popover"] li {{
               background-color: {p["panel"]} !important; color: {p["text"]} !important;
+              font-family: {MONO}; font-size: .78rem;
           }}
           [data-baseweb="select"] svg {{ fill: {p["muted"]}; }}
-          /* Seven tabs overflow a phone-width viewport, and Streamlit gives the
-             strip no visible scroll affordance — the later tabs (Backtest, Bot,
-             Settings) simply vanish. Wrapping keeps every tab reachable. */
+          [data-baseweb="tag"] {{ border-radius: 0 !important; font-family: {MONO}; }}
+          label p {{
+              font-family: {MONO} !important; font-size: .64rem !important;
+              text-transform: uppercase; letter-spacing: .11em;
+              color: {p["chrome_dim"]} !important;
+          }}
+
+          /* ---- tabs: a function rail, not pills ------------------------- */
           [data-testid="stTabs"] [role="tablist"] {{
-              flex-wrap: wrap !important;
-              overflow-x: visible !important;
-              row-gap: .1rem;
+              flex-wrap: wrap !important; overflow-x: visible !important;
+              row-gap: 0; gap: 0; border-bottom: 1px solid {p["border"]};
           }}
-          [data-testid="stTabs"] [role="tab"] {{ white-space: nowrap; }}
-          /* Figures in tables, metrics and code align only with tabular numerals. */
+          [data-testid="stTabs"] [role="tab"] {{
+              white-space: nowrap; font-family: {MONO};
+              font-size: .72rem; letter-spacing: .11em; text-transform: uppercase;
+              padding: .35rem .8rem; color: {p["muted"]};
+              border-bottom: 2px solid transparent;
+          }}
+          [data-testid="stTabs"] [role="tab"][aria-selected="true"] {{
+              color: {p["chrome"]}; border-bottom-color: {p["chrome"]}; background: {p["panel"]};
+          }}
+
+          /* ---- figures -------------------------------------------------- */
           [data-testid="stMetricValue"], [data-testid="stDataFrame"], .bvc-mono {{
-              font-family: {MONO};
-              font-variant-numeric: tabular-nums;
+              font-family: {MONO}; font-variant-numeric: tabular-nums;
           }}
-          [data-testid="stMetricValue"] {{ font-size: 1.45rem; }}
+          [data-testid="stMetricValue"] {{ font-size: 1.3rem; }}
           [data-testid="stMetricLabel"] p {{
-              text-transform: uppercase; letter-spacing: .08em;
-              font-size: .68rem; color: {p["muted"]};
+              text-transform: uppercase; letter-spacing: .1em;
+              font-size: .62rem; color: {p["chrome_dim"]};
           }}
+
+          /* ---- panels: boxed, amber title rail with a numbered chip ----- */
           .bvc-panel {{
-              border: 1px solid {p["border"]}; border-radius: 6px;
-              background: {p["panel"]}; padding: .55rem .8rem .7rem;
-              margin-bottom: .6rem;
+              border: 1px solid {p["border"]}; border-radius: 0;
+              background: {p["panel"]}; padding: 0 .65rem .5rem; margin-bottom: .5rem;
           }}
           .bvc-panel-title {{
-              font-family: {MONO}; font-size: .7rem; font-weight: 700;
-              text-transform: uppercase; letter-spacing: .14em;
-              color: {p["muted"]}; border-bottom: 1px solid {p["border"]};
-              padding-bottom: .35rem; margin-bottom: .5rem;
+              font-family: {MONO}; font-size: .66rem; font-weight: 700;
+              text-transform: uppercase; letter-spacing: .16em; color: {p["chrome"]};
+              border-bottom: 1px solid {p["border"]};
+              padding: .34rem 0 .28rem; margin: 0 0 .4rem;
           }}
+          .bvc-panel-title .idx {{
+              color: {p["surface"]}; background: {p["chrome"]};
+              padding: 0 .32rem; margin-right: .45rem; font-weight: 700;
+          }}
+
+          /* ---- status strip --------------------------------------------- */
           .bvc-strip {{
               display: flex; flex-wrap: wrap; gap: 0;
-              border: 1px solid {p["border"]}; border-radius: 6px;
-              background: {p["panel"]}; overflow: hidden; margin-bottom: .75rem;
+              border: 1px solid {p["border"]}; border-radius: 0;
+              background: {p["panel"]}; overflow: hidden; margin-bottom: .5rem;
           }}
           .bvc-cell {{
-              flex: 1 1 118px; padding: .5rem .8rem;
+              flex: 1 1 116px; padding: .32rem .7rem;
               border-right: 1px solid {p["border"]};
           }}
           .bvc-cell:last-child {{ border-right: none; }}
           .bvc-cell .k {{
-              font-family: {MONO}; font-size: .62rem; letter-spacing: .12em;
-              text-transform: uppercase; color: {p["muted"]};
+              font-family: {MONO}; font-size: .57rem; letter-spacing: .15em;
+              text-transform: uppercase; color: {p["chrome_dim"]};
           }}
           .bvc-cell .v {{
-              font-family: {MONO}; font-size: 1.05rem; font-weight: 700;
+              font-family: {MONO}; font-size: 1rem; font-weight: 700;
               color: {p["text"]}; font-variant-numeric: tabular-nums;
           }}
+
+          /* ---- data rows: zebra, tight, tabular -------------------------- */
           .bvc-row {{
-              display: grid; align-items: center; gap: .5rem;
-              font-family: {MONO}; font-size: .78rem;
-              padding: .3rem 0; border-bottom: 1px solid {p["border"]};
+              display: grid; align-items: center; gap: .4rem;
+              font-family: {MONO}; font-size: .75rem;
+              padding: .2rem .3rem; border-bottom: 1px solid {p["border"]};
               font-variant-numeric: tabular-nums;
           }}
+          .bvc-row:nth-of-type(even) {{ background: {p["panel_alt"]}; }}
           .bvc-row:last-child {{ border-bottom: none; }}
           .bvc-head {{
-              color: {p["muted"]}; font-size: .64rem; letter-spacing: .1em;
-              text-transform: uppercase; border-bottom: 1px solid {p["border"]};
+              color: {p["chrome"]}; font-size: .59rem; letter-spacing: .13em;
+              text-transform: uppercase; background: transparent !important;
+              border-bottom: 1px solid {p["border"]};
           }}
           .bvc-tag {{
-              font-family: {MONO}; font-size: .68rem; font-weight: 700;
-              letter-spacing: .06em; padding: .1rem .45rem; border-radius: 3px;
+              font-family: {MONO}; font-size: .65rem; font-weight: 700;
+              letter-spacing: .06em; padding: .05rem .4rem; border-radius: 0;
               border: 1px solid currentColor; white-space: nowrap;
           }}
           /* Anything that is not MONITOR wants a decision now, so it blinks. */
@@ -230,13 +271,18 @@ def inject_terminal_css() -> None:
           .t-crit {{ color: {p["critical"]}; }}
           .t-idle {{ color: {p["muted"]}; }}
           .t-accent {{ color: {p["series_1"]}; }}
+          .t-chrome {{ color: {p["chrome"]}; }}
           .bvc-footer {{
-              font-family: {MONO}; font-size: .7rem; color: {p["muted"]};
-              border-top: 1px solid {p["border"]}; padding-top: .5rem;
-              margin-top: .4rem; letter-spacing: .04em;
+              font-family: {MONO}; font-size: .65rem; color: {p["muted"]};
+              border-top: 1px solid {p["border"]}; padding-top: .38rem;
+              margin-top: .3rem; letter-spacing: .06em;
           }}
-          /* A live risk figure must never blink — motion on a number you are
-             about to act on costs legibility exactly when it matters most. */
+          .bvc-footer b {{ color: {p["chrome"]}; }}
+
+          /* ---- misc ------------------------------------------------------ */
+          [data-testid="stDataFrame"] {{ border: 1px solid {p["border"]}; }}
+          [data-testid="stAlert"] {{ border-radius: 0; font-family: {MONO}; font-size: .77rem; }}
+          hr {{ border-color: {p["border"]}; }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -297,8 +343,8 @@ def fmt_pct(value: Optional[float], digits: int = 1) -> str:
 def render_sidebar(bot: TradingBot) -> None:
     settings = bot.settings
     with st.sidebar:
-        st.markdown("### Brickvestcapitalterminal")
-        st.caption("Variance risk premium harvesting · Alpaca paper")
+        st.markdown("### BVC Terminal")
+        st.caption("Brickvestcapitalterminal · variance risk premium · Alpaca")
 
         # ---- link state --------------------------------------------------
         health = bot.client.health
@@ -429,10 +475,10 @@ def render_deck(bot: TradingBot) -> None:
     st.write("")
     left, right = st.columns(2)
     with left:
-        st.markdown('<div class="bvc-panel-title">Realised income by month (ZAR)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="bvc-panel-title"><span class="idx">3</span>Realised income by month · ZAR</div>', unsafe_allow_html=True)
         render_monthly_income_chart(zar_by_month, settings.monthly_target_zar)
     with right:
-        st.markdown('<div class="bvc-panel-title">Cumulative realised P&L (ZAR)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="bvc-panel-title"><span class="idx">4</span>Cumulative realised P&L · ZAR</div>', unsafe_allow_html=True)
         render_cumulative_pnl_chart(closed)
 
     render_expectancy_panel(expectancy, account, settings, palette)
@@ -584,7 +630,7 @@ def render_target_acquisition(bot: TradingBot) -> None:
     )
     stamp = f"{scanned_at:%H:%M:%S}" if scanned_at else "--:--:--"
     st.markdown(
-        f'<div class="bvc-panel"><div class="bvc-panel-title">◆ Target acquisition · IV−RV'
+        f'<div class="bvc-panel"><div class="bvc-panel-title"><span class="idx">1</span>Target acquisition · IV−RV'
         f'<span style="float:right;letter-spacing:.06em">{stamp}</span></div>{header}{rows}</div>',
         unsafe_allow_html=True,
     )
@@ -600,7 +646,7 @@ def render_risk_manager(bot: TradingBot, fx_quote) -> None:
         positions = [p for p in bot.client.get_option_positions() if p.is_short]
     except BrokerError as exc:
         st.markdown(
-            f'<div class="bvc-panel"><div class="bvc-panel-title">▣ Risk manager</div>'
+            f'<div class="bvc-panel"><div class="bvc-panel-title"><span class="idx">2</span>Risk manager</div>'
             f'<div class="bvc-row t-crit">position feed down — {exc}</div></div>',
             unsafe_allow_html=True,
         )
@@ -639,7 +685,7 @@ def render_risk_manager(bot: TradingBot, fx_quote) -> None:
             )
 
     st.markdown(
-        f'<div class="bvc-panel"><div class="bvc-panel-title">▣ Risk manager · managed brackets</div>'
+        f'<div class="bvc-panel"><div class="bvc-panel-title"><span class="idx">2</span>Risk manager · managed brackets</div>'
         f"{header}{body}</div>",
         unsafe_allow_html=True,
     )
@@ -652,7 +698,7 @@ def render_risk_manager(bot: TradingBot, fx_quote) -> None:
 def render_expectancy_panel(expectancy, account, settings, palette) -> None:
     """The expectancy formula, spelled out, with the bracket's breakeven hurdle."""
     hurdle = engine.breakeven_win_rate()
-    st.markdown('<div class="bvc-panel-title">Σ Expectancy</div>', unsafe_allow_html=True)
+    st.markdown('<div class="bvc-panel-title"><span class="idx">5</span>Expectancy</div>', unsafe_allow_html=True)
     if expectancy.has_data:
         grid = st.columns(4)
         grid[0].metric("Win rate", fmt_pct(expectancy.p_win, 0), delta=f"{(expectancy.p_win - hurdle) * 100:+.0f}pts vs breakeven")
@@ -1120,7 +1166,7 @@ def render_backtest(bot: TradingBot) -> None:
     """Replay the configured rules over history, with the VRP assumption exposed."""
     import backtest as bt
 
-    st.markdown('<div class="bvc-panel-title">◈ Historical replay</div>', unsafe_allow_html=True)
+    st.markdown('<div class="bvc-panel-title"><span class="idx">1</span>Historical replay</div>', unsafe_allow_html=True)
     st.caption(
         "The same rules the bot trades, run over historical prices. Option prices are modelled — "
         "no free source carries years of historical implied volatility — so the premium assumption "
@@ -1253,16 +1299,16 @@ def render_backtest_results(result, null, bot: TradingBot) -> None:
 
     left, right = st.columns([3, 2])
     with left:
-        st.markdown('<div class="bvc-panel-title">Equity curve</div>', unsafe_allow_html=True)
+        st.markdown('<div class="bvc-panel-title"><span class="idx">2</span>Equity curve</div>', unsafe_allow_html=True)
         render_equity_curve(result, null)
     with right:
-        st.markdown('<div class="bvc-panel-title">Drawdown</div>', unsafe_allow_html=True)
+        st.markdown('<div class="bvc-panel-title"><span class="idx">3</span>Drawdown</div>', unsafe_allow_html=True)
         render_drawdown(result)
 
     if not result.trades:
         return
 
-    st.markdown('<div class="bvc-panel-title">Trades</div>', unsafe_allow_html=True)
+    st.markdown('<div class="bvc-panel-title"><span class="idx">4</span>Trades</div>', unsafe_allow_html=True)
     mix = {}
     for trade in result.trades:
         mix[trade["exit_reason"]] = mix.get(trade["exit_reason"], 0) + 1
@@ -1413,20 +1459,36 @@ def main() -> None:
              "down": ("OFFLINE", palette["critical"])}[health.status]
         )
 
+    now = datetime.now(timezone.utc)
+    try:
+        market_open = bot.client.is_market_open() if bot.client.is_connected else None
+    except BrokerError:
+        market_open = None
+    if market_open is None:
+        session, session_colour = "SESSION —", palette["muted"]
+    elif market_open:
+        session, session_colour = "MKT OPEN", palette["good"]
+    else:
+        session, session_colour = "MKT CLOSED", palette["muted"]
+
     st.markdown(
         f"""
-        <div style="font-family:{MONO};border:1px solid {palette['border']};border-radius:6px;
-                    background:{palette['panel']};padding:.55rem .9rem;margin-bottom:.75rem;
-                    display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;">
-          <span style="font-weight:700;letter-spacing:.22em;font-size:.95rem;color:{palette['text']};">
-            BRICKVEST CAPITAL TERMINAL
+        <div style="font-family:{MONO};background:{palette['panel']};
+                    border:1px solid {palette['border']};border-left:3px solid {palette['chrome']};
+                    padding:.4rem .8rem;margin-bottom:.5rem;display:flex;
+                    justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;">
+          <span style="font-weight:700;letter-spacing:.28em;font-size:.92rem;color:{palette['chrome']};">
+            BRICKVEST&nbsp;CAPITAL&nbsp;TERMINAL
           </span>
-          <span style="font-size:.7rem;letter-spacing:.1em;color:{palette['muted']};">
-            VARIANCE RISK PREMIUM · {bot.settings.target_dte} DTE · {bot.settings.target_delta:.2f}Δ ·
-            IVR &gt; {bot.settings.min_iv_rank:.0f} · ALPACA {'PAPER' if bot.settings.paper else 'LIVE'}
+          <span style="font-size:.63rem;letter-spacing:.13em;color:{palette['muted']};">
+            VRP&nbsp;·&nbsp;{bot.settings.target_dte}D&nbsp;·&nbsp;{bot.settings.target_delta:.2f}&Delta;
+            &nbsp;·&nbsp;IVR&gt;{bot.settings.min_iv_rank:.0f}
+            &nbsp;·&nbsp;ALPACA&nbsp;{'PAPER' if bot.settings.paper else 'LIVE'}
           </span>
-          <span style="font-size:.8rem;font-weight:700;letter-spacing:.12em;color:{colour};">
-            STATUS: {banner}
+          <span style="font-size:.68rem;letter-spacing:.12em;font-variant-numeric:tabular-nums;">
+            <span style="color:{session_colour};font-weight:700;">{session}</span>
+            <span style="color:{palette['muted']};">&nbsp;|&nbsp;{now:%Y-%m-%d %H:%M:%S}Z&nbsp;|&nbsp;</span>
+            <span style="color:{colour};font-weight:700;">{banner}</span>
           </span>
         </div>
         """,
