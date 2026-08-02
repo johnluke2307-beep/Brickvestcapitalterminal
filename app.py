@@ -1091,6 +1091,20 @@ def render_bot_console(bot: TradingBot) -> None:
 # ======================================================================================
 # Tab — Backtest
 # ======================================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_backtest_history(symbols: tuple, start: str, end: str, _broker=None):
+    """Price history for the backtester, cached for an hour.
+
+    Two reasons this matters on a hosted deployment: the null-hypothesis run
+    needs the same frames as the main run and must not fetch them twice, and
+    Yahoo rate-limits shared cloud IP ranges — so every avoided download is one
+    less chance of a 429 on a rerun.
+    """
+    import backtest as bt
+
+    return bt.load_history(list(symbols), start, end, broker=_broker)
+
+
 def render_backtest(bot: TradingBot) -> None:
     """Replay the configured rules over history, with the VRP assumption exposed."""
     import backtest as bt
@@ -1153,12 +1167,18 @@ def render_backtest(bot: TradingBot) -> None:
             max_margin_utilization=bot.settings.max_margin_utilization,
         )
         try:
-            with st.spinner("Loading history and replaying…"):
-                result = bt.run_backtest(cfg, broker=bot.client if bot.client.is_connected else None)
+            broker = bot.client if bot.client.is_connected else None
+            with st.spinner("Loading history…"):
+                prices = load_backtest_history(tuple(symbols), start, end, _broker=broker)
+            missing = [s for s in symbols if s not in prices]
+            with st.spinner("Replaying…"):
+                result = bt.Backtester(cfg, prices).run()
+                if missing:
+                    result.warnings.insert(0, f"No history for {', '.join(missing)} — excluded from the run.")
                 null = None
                 if compare_null and vrp_points > 0:
-                    null_cfg = replace(cfg, vrp_points=0.0)
-                    null = bt.run_backtest(null_cfg, broker=bot.client if bot.client.is_connected else None)
+                    # Same frames, same rules, no premium — the honest control.
+                    null = bt.Backtester(replace(cfg, vrp_points=0.0), prices).run()
             st.session_state["bt_result"] = result
             st.session_state["bt_null"] = null
         except Exception as exc:

@@ -127,6 +127,13 @@ python backtest.py --strategy put_credit_spread --vrp 0.03
 python backtest.py --strategy put_credit_spread --vrp 0     # the null
 ```
 
+It runs on a hosted Streamlit deployment with **no Alpaca keys** — history comes
+from yfinance, so the Backtest tab is usable before any secrets are set. A
+six-year run over four symbols takes about 5 seconds and a couple of megabytes;
+downloads are cached for an hour and shared with the null run, which halves the
+requests. If Yahoo rate-limits the host (shared cloud IP ranges do get 429s), the
+loader falls back to the broker feed when the Alpaca client is connected.
+
 What it does **not** model: bid/ask spread, early assignment, dividend and pin
 risk, volatility skew across strikes, or whether a strike was actually listed and
 liquid. Real fills are worse than these. Treat the output as a sanity check on the

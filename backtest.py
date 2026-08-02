@@ -147,12 +147,8 @@ def load_history(
             progress=False, group_by="ticker", threads=False,
         )
         for symbol in symbols:
-            frame = raw[symbol] if len(symbols) > 1 else raw
-            frame = frame[["Open", "High", "Low", "Close"]].dropna()
-            frame.columns = [c.lower() for c in frame.columns]
-            if getattr(frame.index, "tz", None) is not None:
-                frame.index = frame.index.tz_localize(None)
-            if not frame.empty:
+            frame = _extract_symbol(raw, symbol)
+            if frame is not None and not frame.empty:
                 frames[symbol] = frame
         if frames:
             return frames
@@ -184,6 +180,34 @@ def load_history(
     if not frames:
         raise RuntimeError("No price history could be loaded for the requested symbols.")
     return frames
+
+
+def _extract_symbol(raw: "pd.DataFrame", symbol: str) -> Optional["pd.DataFrame"]:
+    """Pull one symbol's OHLC out of a yfinance frame, whatever shape it came in.
+
+    yfinance returns flat columns for a single ticker but a MultiIndex for
+    several, and which level holds the ticker has moved between releases. Rather
+    than branch on the version or the symbol count, inspect the frame.
+    """
+    import pandas as pd
+
+    frame = raw
+    if isinstance(raw.columns, pd.MultiIndex):
+        if symbol in raw.columns.get_level_values(0):
+            frame = raw.xs(symbol, axis=1, level=0)
+        elif symbol in raw.columns.get_level_values(-1):
+            frame = raw.xs(symbol, axis=1, level=-1)
+        else:
+            return None
+
+    wanted = {c.lower(): c for c in frame.columns}
+    if not {"open", "high", "low", "close"} <= set(wanted):
+        return None
+    frame = frame[[wanted[c] for c in ("open", "high", "low", "close")]].dropna()
+    frame.columns = ["open", "high", "low", "close"]
+    if getattr(frame.index, "tz", None) is not None:
+        frame.index = frame.index.tz_localize(None)
+    return frame
 
 
 def volatility_frame(prices: "pd.DataFrame", window: int, lookback: int) -> "pd.DataFrame":

@@ -506,6 +506,36 @@ def test_backtest_respects_the_margin_ceiling() -> None:
     assert result.metrics["trades"] >= 0
 
 
+def test_yfinance_frame_shapes_all_parse() -> None:
+    """yfinance returns different column shapes per version and symbol count.
+
+    Flat for one ticker, MultiIndex for several, and the ticker level has moved
+    between releases — so the extractor inspects the frame instead of guessing.
+    """
+    import pandas as pd
+
+    import backtest as bt
+
+    index = pd.bdate_range("2020-01-01", periods=5)
+    ohlc = {
+        "Open": [1, 2, 3, 4, 5], "High": [2, 3, 4, 5, 6],
+        "Low": [0.5, 1, 2, 3, 4], "Close": [1.5, 2.5, 3.5, 4.5, 5.5],
+        "Volume": [9] * 5,
+    }
+    flat = pd.DataFrame(ohlc, index=index)
+    level0 = pd.concat({"SPY": pd.DataFrame(ohlc, index=index),
+                        "QQQ": pd.DataFrame(ohlc, index=index)}, axis=1)
+    level1 = level0.swaplevel(0, 1, axis=1).sort_index(axis=1)
+
+    for raw in (flat, level0, level1):
+        frame = bt._extract_symbol(raw, "SPY")
+        assert frame is not None
+        assert list(frame.columns) == ["open", "high", "low", "close"]
+        assert len(frame) == 5
+
+    assert bt._extract_symbol(level0, "NOTLISTED") is None
+
+
 # ======================================================================================
 # Runner
 # ======================================================================================
