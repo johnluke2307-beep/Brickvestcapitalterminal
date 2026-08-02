@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "updated_at": "2026-08-02T00:00:00+00:00",
+  "updated_by": "operator",
+  "rationale": "Baseline mechanical VRP parameters: sell the 30-delta put ~45 DTE when IV Rank > 50 and IV exceeds RV, take profit at 50% of the credit, stop at 200%, close anything still open inside 21 DTE.",
+  "evidence": {
+    "out_of_sample_validated": false,
+    "note": "Defaults, not a fitted result. Every value here matches the hard-coded default in config.Settings."
+  },
+  "parameters": {
+    "target_delta": 0.3,
+    "delta_tolerance": 0.08,
+    "target_dte": 45,
+    "min_iv_rank": 50.0,
+    "min_vrp": 0.02,
+    "profit_target_pct": 0.5,
+    "stop_loss_multiple": 2.0,
+    "time_exit_dte": 21,
+    "min_credit_usd": 0.35,
+    "max_spread_pct": 0.2,
+    "max_margin_utilization": 0.5,
+    "max_open_positions": 6,
+    "max_new_positions_per_day": 2,
+    "contracts_per_trade": 1,
+    "min_equity_usd": 2000.0
+  }
+}

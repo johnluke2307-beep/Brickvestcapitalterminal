@@ -4,20 +4,44 @@ Brickvestcapitalterminal — central configuration.
 Every tunable lives here so the strategy can be audited in one place. Values are
 resolved with the following precedence:
 
-    1. Environment variables            (best for Hugging Face Spaces / Docker)
-    2. ``st.secrets``                   (best for Streamlit Community Cloud)
-    3. The defaults declared below      (safe, paper-trading oriented)
+    1. ``strategy_config.json``         (the agent-writable overlay — see below)
+    2. Environment variables            (best for Hugging Face Spaces / Docker)
+    3. ``st.secrets``                   (best for Streamlit Community Cloud)
+    4. The defaults declared below      (safe, paper-trading oriented)
 
 Nothing in this module imports Streamlit at module scope, so ``bot.py`` can be
 run head-less (cron, a worker dyno, a terminal) without pulling in the UI stack.
+
+The agent-writable overlay
+--------------------------
+The research layer (Hermes) never calls into the execution layer. It writes a
+JSON file; the execution loop reads it. That file is the *entire* interface, and
+this module is where it is policed:
+
+* Only keys in :data:`HERMES_BOUNDS` are read. A ``broker``, ``paper`` or
+  ``alpaca_api_key`` entry in the file is ignored, not applied — promoting to
+  live money is not expressible in the agent's vocabulary.
+* Every value must sit inside its declared bound.
+* **Risk limits ratchet.** The overlay may only move a ``risk_limit`` parameter
+  in the safer direction *relative to the operator's own env/default baseline*.
+  A hand-edited file claiming ``max_margin_utilization: 0.95`` resolves to the
+  operator's value, and says so in :attr:`Settings.overlay_notes`.
+
+So the worst case of a corrupted, hostile or hallucinated config file is a
+terminal that trades less than the operator allowed — never more.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List
+from typing import Any, Dict, List, Tuple
+
+logger = logging.getLogger("brickvest.config")
 
 # --------------------------------------------------------------------------------------
 # Paths — everything the platform persists lives under ./state (git-ignored).
@@ -28,6 +52,14 @@ IV_HISTORY_PATH = STATE_DIR / "iv_history.csv"
 TRADE_LOG_PATH = STATE_DIR / "trade_log.csv"
 BOT_STATE_PATH = STATE_DIR / "bot_state.json"
 FX_CACHE_PATH = STATE_DIR / "fx_cache.json"
+#: Drop-box for an out-of-process stop request. Declared here, not in ``bot``,
+#: so a process that must never import the broker layer can still write it.
+HALT_REQUEST_PATH = STATE_DIR / "halt_request.json"
+
+#: The Hermes ↔ engine contract. Lives at the repo root rather than under
+#: ``state/`` because it is a reviewable artifact: you should be able to read
+#: the diff of what the agent changed about your strategy.
+STRATEGY_CONFIG_PATH = Path(os.getenv("BVC_STRATEGY_CONFIG", ROOT_DIR / "strategy_config.json"))
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -90,6 +122,181 @@ def _list(key: str, default: List[str]) -> List[str]:
 # Liquid, optionable, high-volume underlyings. ETFs are preferred for mechanical
 # premium selling: no earnings gaps, tighter spreads, index-like kurtosis.
 DEFAULT_UNIVERSE = ["SPY", "QQQ", "IWM", "DIA", "XLF", "EEM", "GLD", "TLT"]
+
+
+# --------------------------------------------------------------------------------------
+# What an agent is allowed to touch
+# --------------------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Bound:
+    """One tunable, its permitted range, and which direction counts as safer.
+
+    ``safer`` says which way tightens risk. ``risk_limit=True`` means the value
+    may only move in that direction — the ratchet that makes a misaligned agent
+    trade less rather than more.
+    """
+
+    low: float
+    high: float
+    safer: str = "either"     # "lower" | "higher" | "either"
+    risk_limit: bool = False
+    note: str = ""
+
+    def clamp_ok(self, value: float) -> bool:
+        return self.low <= value <= self.high
+
+    def loosens(self, proposed: float, baseline: float) -> bool:
+        """True when moving ``baseline`` → ``proposed`` takes on more risk."""
+        if not self.risk_limit or float(proposed) == float(baseline):
+            return False
+        if self.safer == "lower":
+            return float(proposed) > float(baseline)
+        if self.safer == "higher":
+            return float(proposed) < float(baseline)
+        return False
+
+
+#: The complete set of parameters an agent can move. Anything absent is
+#: immutable from the agent's side — including the universe, the broker,
+#: credentials and the paper/live flag. Promoting to live is a human decision by
+#: construction, because the agent has no word for it.
+HERMES_BOUNDS: Dict[str, Bound] = {
+    # ---- strategy shape: the agent may explore freely inside sane limits ----
+    "target_delta": Bound(0.10, 0.45, "lower", note="lower delta = further OTM = safer"),
+    "delta_tolerance": Bound(0.02, 0.15),
+    "target_dte": Bound(21, 60),
+    "min_iv_rank": Bound(0.0, 90.0, "higher", note="higher bar = fewer, richer entries"),
+    "min_vrp": Bound(0.0, 0.15, "higher"),
+    "profit_target_pct": Bound(0.20, 0.90),
+    "stop_loss_multiple": Bound(1.0, 4.0, "lower", note="a tighter stop caps the tail"),
+    "time_exit_dte": Bound(0, 30, "higher", note="exiting earlier reduces gamma risk"),
+    "min_credit_usd": Bound(0.10, 5.00, "higher"),
+    "max_spread_pct": Bound(0.02, 0.50, "lower"),
+
+    # ---- risk limits: ratcheted. Tighten only. -----------------------------
+    "max_margin_utilization": Bound(0.05, 0.50, "lower", risk_limit=True,
+                                    note="the fat-tail governor — may only be reduced"),
+    "max_open_positions": Bound(1, 6, "lower", risk_limit=True),
+    "max_new_positions_per_day": Bound(1, 2, "lower", risk_limit=True),
+    "contracts_per_trade": Bound(1, 10, "lower", risk_limit=True),
+    "min_equity_usd": Bound(2000.0, 1_000_000.0, "higher", risk_limit=True),
+}
+
+
+def vet_changes(
+    baseline: Dict[str, Any], changes: Dict[str, Any]
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """Filter a proposed parameter dict down to what is actually permitted.
+
+    The single gate every mutation path goes through — the JSON overlay, the
+    in-process control surface and the HTTP API all call this, so there is one
+    place to read to know what an agent can do to this account.
+
+    Returns ``(accepted, rejected)`` where ``rejected`` maps each refused key to
+    a specific reason. Keys are judged independently on purpose: a proposal that
+    mixes one legal and one illegal change applies the legal half and explains
+    the rest, which is something an agent can learn from. A blanket refusal is
+    not.
+    """
+    accepted: Dict[str, Any] = {}
+    rejected: Dict[str, str] = {}
+
+    for name, raw in changes.items():
+        bound = HERMES_BOUNDS.get(name)
+        if bound is None:
+            rejected[name] = "not an agent-mutable parameter"
+            continue
+        if name not in baseline:
+            rejected[name] = "no baseline value to compare against"
+            continue
+        current = baseline[name]
+        try:
+            value = type(current)(raw) if not isinstance(current, bool) else bool(raw)
+            numeric = float(value)
+        except (TypeError, ValueError):
+            rejected[name] = f"{raw!r} is not a valid value"
+            continue
+        if not bound.clamp_ok(numeric):
+            rejected[name] = f"outside the permitted range [{bound.low}, {bound.high}]"
+            continue
+        if bound.loosens(numeric, float(current)):
+            rejected[name] = (
+                f"risk limits ratchet one way: {name} may only move "
+                f"{bound.safer} (baseline {current})"
+            )
+            continue
+        accepted[name] = value
+    return accepted, rejected
+
+
+# --------------------------------------------------------------------------------------
+# The strategy config file — the whole of the agent's write surface
+# --------------------------------------------------------------------------------------
+class StrategyConfigFile:
+    """Read/write access to ``strategy_config.json``.
+
+    Nothing here touches a broker, an account or an order. That is the point:
+    the research layer's only reachable verb is "write a number into a file",
+    and the execution layer decides for itself when and whether to read it.
+    """
+
+    def __init__(self, path: Path | str | None = None) -> None:
+        self.path = Path(path or STRATEGY_CONFIG_PATH)
+
+    def mtime(self) -> float:
+        try:
+            return self.path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def read(self) -> dict:
+        """The file as written, or an empty document when absent/corrupt."""
+        try:
+            payload = json.loads(self.path.read_text())
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError) as exc:
+            # A malformed config must not stop the bot; it must stop the
+            # *overlay*. The engine falls back to the operator's own settings.
+            logger.warning("strategy config unreadable, ignoring overlay: %s", exc)
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def parameters(self) -> Dict[str, Any]:
+        params = self.read().get("parameters")
+        return dict(params) if isinstance(params, dict) else {}
+
+    def write(
+        self,
+        parameters: Dict[str, Any],
+        *,
+        rationale: str = "",
+        evidence: Dict[str, Any] | None = None,
+        actor: str = "hermes",
+    ) -> dict:
+        """Persist a full parameter set with the provenance that produced it.
+
+        The rationale and evidence are stored beside the numbers deliberately.
+        A parameter file without the argument for its values is a set of magic
+        constants, and six weeks later nobody can tell a validated change from
+        a lucky one.
+        """
+        document = {
+            "version": 1,
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "updated_by": actor,
+            "rationale": rationale,
+            "evidence": evidence or {},
+            "parameters": parameters,
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(document, indent=2, sort_keys=False) + "\n")
+        tmp.replace(self.path)  # atomic: the bot never reads a half-written file
+        return document
+
+
+STRATEGY_CONFIG = StrategyConfigFile()
 
 
 @dataclass
@@ -196,7 +403,63 @@ class Settings:
     #: When true the bot scans, scores and logs but never sends an order.
     dry_run: bool = field(default_factory=lambda: _bool("BVC_DRY_RUN", False))
 
+    # ---------------------------------------------------------------- overlay provenance
+    #: Which parameters came from ``strategy_config.json`` rather than from the
+    #: operator, and what the file asked for that was refused. Rendered in the
+    #: UI and returned by the API so an agent's footprint is never invisible.
+    overlay_applied: dict = field(default_factory=dict)
+    overlay_rejected: dict = field(default_factory=dict)
+    #: What each overlaid parameter was *before* the file touched it. This is
+    #: the ratchet's fixed reference — without it, re-reading the file would
+    #: let a risk limit be walked outward one legal step per reload.
+    overlay_baseline: dict = field(default_factory=dict)
+    overlay_updated_at: str = ""
+    overlay_updated_by: str = ""
+
     # ---------------------------------------------------------------- derived helpers
+    def mutable_values(self) -> Dict[str, Any]:
+        """Current value of every agent-mutable parameter."""
+        return {name: getattr(self, name) for name in HERMES_BOUNDS if hasattr(self, name)}
+
+    def baseline_values(self) -> Dict[str, Any]:
+        """Agent-mutable parameters as the *operator* set them, overlay undone."""
+        values = self.mutable_values()
+        values.update(self.overlay_baseline)
+        return values
+
+    def apply_overlay(self, source: StrategyConfigFile | None = None) -> "Settings":
+        """Fold ``strategy_config.json`` in on top of the operator's baseline.
+
+        Called against a ``Settings`` that has *not* yet been overlaid, so the
+        ratchet always compares against what the human configured — repeated
+        reloads can never walk a risk limit outward one small step at a time.
+        """
+        source = source or STRATEGY_CONFIG
+        document = source.read()
+        requested = document.get("parameters")
+        baseline = self.baseline_values()
+
+        # A parameter the file no longer mentions reverts to the operator's
+        # value. Dropping a line from the config must actually undo it.
+        for name, value in self.overlay_baseline.items():
+            setattr(self, name, value)
+        self.overlay_applied, self.overlay_rejected, self.overlay_baseline = {}, {}, {}
+
+        if not isinstance(requested, dict) or not requested:
+            return self
+
+        accepted, rejected = vet_changes(baseline, requested)
+        for name, value in accepted.items():
+            setattr(self, name, value)
+        self.overlay_baseline = {name: baseline[name] for name in accepted}
+        self.overlay_applied = accepted
+        self.overlay_rejected = rejected
+        self.overlay_updated_at = str(document.get("updated_at") or "")
+        self.overlay_updated_by = str(document.get("updated_by") or "")
+        for name, why in rejected.items():
+            logger.warning("strategy config: %s refused — %s", name, why)
+        return self
+
     @property
     def uses_ibkr(self) -> bool:
         return self.broker in {"ibkr", "ib", "interactive_brokers"}
@@ -226,9 +489,15 @@ class Settings:
         return data
 
 
-def load_settings() -> Settings:
-    """Build a fresh :class:`Settings` snapshot (re-reads env and secrets)."""
-    return Settings()
+def load_settings(*, overlay: bool = True) -> Settings:
+    """Build a fresh :class:`Settings` snapshot (re-reads env, secrets and file).
+
+    Pass ``overlay=False`` for the operator baseline with no agent influence at
+    all — that is what the ratchet is measured against, and what the UI shows as
+    "your settings" beside "what the agent changed".
+    """
+    settings = Settings()
+    return settings.apply_overlay() if overlay else settings
 
 
 #: Import-time singleton for convenience; call :func:`load_settings` for a fresh read.

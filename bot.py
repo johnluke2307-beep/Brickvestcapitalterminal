@@ -58,6 +58,46 @@ OPTION_MULTIPLIER = 100
 
 
 # ======================================================================================
+# Hard risk limits — outside the agent's reach by construction
+# ======================================================================================
+def _limit(key: str, default: float) -> float:
+    try:
+        return float(config.setting(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+#: **The kill switch.** If the account's intraday loss reaches this fraction of
+#: its start-of-day equity, the bot halts and a human has to clear it.
+#:
+#: This is deliberately *not* a field on :class:`config.Settings`, and therefore
+#: not in ``HERMES_BOUNDS`` and not expressible in ``strategy_config.json``. The
+#: research layer's only write verb is "put a number in that file", and this
+#: number is not in that file. An agent tuning for return has every incentive to
+#: widen a daily loss limit, and the design answer is not to trust it not to —
+#: it is to make the limit unreachable from where the agent lives.
+#:
+#: The operator can still set it, at the process boundary, before anything runs.
+DAILY_LOSS_LIMIT_PCT = _limit("BVC_DAILY_LOSS_LIMIT_PCT", 0.03)
+
+#: On a kill-switch breach, also market-close every short option position.
+#: Off by default: with a venue that rests real brackets at the exchange the
+#: positions are already protected, and force-liquidating into a panic is its
+#: own way to lose money. Turn it on for venues where the bracket is synthetic
+#: and a halted bot means an unmanaged short.
+KILL_SWITCH_FLATTENS = str(config.setting("BVC_KILL_SWITCH_FLATTEN", "false")).lower() in {
+    "1", "true", "yes", "y", "on"
+}
+
+#: Drop-box for an out-of-process stop request. Anything that can write this
+#: file can stop the bot; nothing that writes a file can start it. That
+#: asymmetry is the point — see :meth:`TradingBot._consume_halt_request`. The
+#: path is declared in ``config`` so the API can write it without importing
+#: this module, which would drag the broker layer into that process.
+HALT_REQUEST_PATH = config.HALT_REQUEST_PATH
+
+
+# ======================================================================================
 # Persistent bot state
 # ======================================================================================
 @dataclass
@@ -161,6 +201,10 @@ class CycleResult:
 class TradingBot:
     """Mechanical 45-DTE / 30-delta premium seller with hard risk guardrails."""
 
+    #: Surfaced on the instance so the observation payload can state the limit
+    #: the agent cannot change, without the agent having to import this module.
+    DAILY_LOSS_LIMIT_PCT = DAILY_LOSS_LIMIT_PCT
+
     def __init__(
         self,
         client: Optional[BrokerClient] = None,
@@ -181,6 +225,7 @@ class TradingBot:
         self._thread: Optional[threading.Thread] = None
         self.last_result: Optional[CycleResult] = None
         self._iv_seeded = False
+        self._config_mtime = config.STRATEGY_CONFIG.mtime()
 
     # ---------------------------------------------------------------- fail-safe
     def halt(self, reason: str) -> None:
@@ -206,6 +251,120 @@ class TradingBot:
         self.state.log_event("info", "halt cleared by operator")
         self.state.save()
 
+    # ------------------------------------------------- agent parameter overlay
+    def reload_strategy_config(self, *, force: bool = False) -> Dict[str, object]:
+        """Re-read ``strategy_config.json`` and adopt whatever it is allowed to change.
+
+        This is the entire mechanism by which the research layer influences
+        trading: a file lands on disk, and the execution loop decides at a safe
+        moment to read it. There is no callback, no socket and no shared object,
+        so a hung, crashed or hostile research process cannot stall or reach
+        into a live event loop.
+
+        Everything the file asks for still goes through
+        :func:`config.vet_changes`, measured against the operator's pre-overlay
+        baseline — reloading a hundred times cannot achieve what one reload may
+        not.
+        """
+        stamp = config.STRATEGY_CONFIG.mtime()
+        if not force and stamp == self._config_mtime:
+            return {}
+        self._config_mtime = stamp
+
+        before = self.settings.mutable_values()
+        self.settings.apply_overlay()
+        changed = {k: v for k, v in self.settings.mutable_values().items() if before.get(k) != v}
+
+        if changed:
+            self.state.log_event(
+                "info",
+                "strategy config reloaded — "
+                + ", ".join(f"{k}={v}" for k, v in changed.items())
+                + (f" (by {self.settings.overlay_updated_by})" if self.settings.overlay_updated_by else ""),
+            )
+        for name, why in self.settings.overlay_rejected.items():
+            self.state.log_event("warning", f"strategy config refused {name}: {why}")
+        if changed or self.settings.overlay_rejected:
+            self.state.save()
+        return changed
+
+    def mark_config_current(self) -> None:
+        """Note that the file on disk is already reflected in memory.
+
+        Used by the in-process control surface, which applies a change and
+        writes the file in one step; without this the next cycle would log a
+        reload for a change it already made.
+        """
+        self._config_mtime = config.STRATEGY_CONFIG.mtime()
+
+    def _consume_halt_request(self) -> Optional[str]:
+        """Honour a stop requested by another process, then delete the request.
+
+        The research layer and the HTTP API have no handle on this object — by
+        design, since a shared handle is a shared failure. What they have is
+        permission to write one small file, which this loop reads at a moment of
+        its own choosing.
+
+        The request is deleted once acted on. A halt file that survived being
+        honoured would re-halt the bot the moment a human resumed it, and the
+        operator would be arguing with a file rather than with a decision.
+        """
+        try:
+            payload = json.loads(HALT_REQUEST_PATH.read_text())
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        HALT_REQUEST_PATH.unlink(missing_ok=True)
+        who = str(payload.get("actor") or "external")
+        return f"{who}: {payload.get('reason') or 'halt requested'}"
+
+    # --------------------------------------------------------- the kill switch
+    def _daily_loss_breach(self, account: AccountSnapshot) -> Optional[str]:
+        """The hard-coded intraday loss limit. Returns a reason, or ``None``.
+
+        Measured against start-of-day equity from the broker's own books rather
+        than against the trade log, so it includes open positions marking
+        against us. A limit that only counts realised losses would sit quiet
+        through exactly the day it exists for.
+        """
+        if DAILY_LOSS_LIMIT_PCT <= 0:
+            return None
+        start_equity = account.last_equity or (account.equity - account.day_pnl)
+        if start_equity <= 0:
+            return None
+        loss_pct = -account.day_pnl / start_equity
+        if loss_pct < DAILY_LOSS_LIMIT_PCT:
+            return None
+        return (
+            f"daily loss limit breached: ${account.day_pnl:,.0f} is {loss_pct:.2%} of "
+            f"start-of-day equity ${start_equity:,.0f}, limit {DAILY_LOSS_LIMIT_PCT:.2%}"
+        )
+
+    def _trip_kill_switch(self, reason: str) -> None:
+        """Flatten if configured to, then halt. Halting is not optional."""
+        if KILL_SWITCH_FLATTENS:
+            for position in self._safe_positions():
+                if not position.is_short:
+                    continue
+                try:
+                    self.client.close_position(position.symbol, int(abs(position.qty)))
+                    self._mark_closing(position.symbol, position.current_price, "kill_switch")
+                    self.state.log_event("critical", f"kill switch flattened {position.symbol}")
+                except BrokerError as exc:
+                    self.state.log_event("critical", f"kill switch could not flatten {position.symbol}: {exc}")
+        elif not getattr(self.client.capabilities, "native_brackets", False):
+            # Say it plainly rather than let the operator discover it later:
+            # a halted bot with synthetic brackets is a bot no longer watching
+            # its own stops.
+            self.state.log_event(
+                "critical",
+                "kill switch halted the bot, but this venue has no resting brackets — "
+                "open short positions are now unmanaged. Set BVC_KILL_SWITCH_FLATTEN=true "
+                "or close them by hand.",
+            )
+        self.halt(reason)
+
     # ------------------------------------------------------------------- cycle
     def run_once(self) -> CycleResult:
         """Execute one full preflight → manage → scan → enter cycle."""
@@ -217,6 +376,20 @@ class TradingBot:
                     result.ok = False
                     result.reason = self.state.halt_reason or "halted"
                     return result
+
+                # ---------------- 0. out-of-process stop, then parameters -----
+                requested = self._consume_halt_request()
+                if requested:
+                    self.halt(requested)
+                    result.halted, result.ok = True, False
+                    result.reason = requested
+                    return result
+
+
+                # Between cycles, never inside one: a cycle that scanned under
+                # one delta target and entered under another is a cycle whose
+                # log cannot be reconstructed.
+                self.reload_strategy_config()
 
                 # ---------------- 1. preflight -------------------------------
                 account = self._preflight(result)
@@ -281,6 +454,16 @@ class TradingBot:
             return None
 
         account = self.client.get_account()  # raises BrokerError → caught upstream
+
+        # The kill switch runs before every other account check. It is the one
+        # rule that does not consult Settings, does not consult the agent and
+        # cannot be tuned from inside the process.
+        breach = self._daily_loss_breach(account)
+        if breach:
+            self._trip_kill_switch(breach)
+            result.halted, result.ok = True, False
+            result.reason = breach
+            return None
 
         if not account.is_healthy:
             self.halt("account is blocked or trading-suspended at the broker")

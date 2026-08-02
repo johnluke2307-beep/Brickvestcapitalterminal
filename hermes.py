@@ -74,49 +74,14 @@ HERMES_AUDIT_PATH = config.STATE_DIR / "hermes_audit.jsonl"
 # ======================================================================================
 # What Hermes is allowed to touch
 # ======================================================================================
-@dataclass(frozen=True)
-class Bound:
-    """One tunable, its permitted range, and which direction counts as safer.
-
-    ``safer`` says which way tightens risk. ``risk_limit=True`` means the agent
-    may only move it in that direction — the ratchet that makes a misaligned
-    agent trade less rather than more.
-    """
-
-    low: float
-    high: float
-    safer: str = "either"     # "lower" | "higher" | "either"
-    risk_limit: bool = False
-    note: str = ""
-
-    def clamp_ok(self, value: float) -> bool:
-        return self.low <= value <= self.high
-
-
-#: The complete set of parameters Hermes can move. Anything absent is immutable
-#: from the agent's side — including the universe, the broker, credentials and
-#: the paper/live flag. Promoting to live is a human decision by construction.
-HERMES_BOUNDS: Dict[str, Bound] = {
-    # ---- strategy shape: the agent may explore freely inside sane limits ----
-    "target_delta": Bound(0.10, 0.45, "lower", note="lower delta = further OTM = safer"),
-    "delta_tolerance": Bound(0.02, 0.15),
-    "target_dte": Bound(21, 60),
-    "min_iv_rank": Bound(0.0, 90.0, "higher", note="higher bar = fewer, richer entries"),
-    "min_vrp": Bound(0.0, 0.15, "higher"),
-    "profit_target_pct": Bound(0.20, 0.90),
-    "stop_loss_multiple": Bound(1.0, 4.0, "lower", note="a tighter stop caps the tail"),
-    "time_exit_dte": Bound(0, 30, "higher", note="exiting earlier reduces gamma risk"),
-    "min_credit_usd": Bound(0.10, 5.00, "higher"),
-    "max_spread_pct": Bound(0.02, 0.50, "lower"),
-
-    # ---- risk limits: ratcheted. Tighten only. -----------------------------
-    "max_margin_utilization": Bound(0.05, 0.50, "lower", risk_limit=True,
-                                    note="the fat-tail governor — may only be reduced"),
-    "max_open_positions": Bound(1, 6, "lower", risk_limit=True),
-    "max_new_positions_per_day": Bound(1, 2, "lower", risk_limit=True),
-    "contracts_per_trade": Bound(1, 10, "lower", risk_limit=True),
-    "min_equity_usd": Bound(2000.0, 1_000_000.0, "higher", risk_limit=True),
-}
+# The bounds table and the gate that enforces it live in ``config`` — the same
+# module the execution loop reads its parameters from — so there is exactly one
+# definition of "what an agent may change", shared by the in-process surface,
+# the JSON overlay and the HTTP API. Re-exported here because this is where
+# people come looking for it.
+Bound = config.Bound
+HERMES_BOUNDS = config.HERMES_BOUNDS
+vet_changes = config.vet_changes
 
 
 # ======================================================================================
@@ -239,6 +204,20 @@ class HermesControl:
                 "enabled": self.enabled,
                 "may_resume_after_halt": False,
                 "experiments_proposed": self.audit.experiment_count(),
+                "config_file": str(config.STRATEGY_CONFIG.path),
+                "overlay_applied": settings.overlay_applied,
+                "overlay_rejected": settings.overlay_rejected,
+                # Stated explicitly so the agent never has to discover these the
+                # expensive way. Nothing it writes can move them.
+                "immovable": {
+                    "daily_loss_limit_pct": self.bot.DAILY_LOSS_LIMIT_PCT,
+                    "note": (
+                        "The daily loss kill switch is hard-coded in the execution module, "
+                        "is not a Settings field, and is not in the mutable set. Neither the "
+                        "config file nor this API can change it. Broker, account, paper/live "
+                        "and credentials are likewise unreachable from here."
+                    ),
+                },
                 "mutable_parameters": {
                     name: {
                         "value": getattr(settings, name, None),
@@ -375,37 +354,27 @@ class HermesControl:
             self._record("propose", verdict, rationale, changes, evidence)
             return verdict
 
-        for name, raw in changes.items():
-            bound = HERMES_BOUNDS.get(name)
-            if bound is None:
-                verdict.rejected[name] = "not a Hermes-mutable parameter"
-                continue
-            try:
-                current = getattr(settings, name)
-                value = type(current)(raw) if not isinstance(current, bool) else bool(raw)
-            except (TypeError, ValueError):
-                verdict.rejected[name] = f"{raw!r} is not a valid value"
-                continue
-            if not bound.clamp_ok(float(value)):
-                verdict.rejected[name] = f"outside the permitted range [{bound.low}, {bound.high}]"
-                continue
+        # Vetted against the *operator's* baseline, not the running values. A
+        # ratchet measured against the last accepted proposal is no ratchet at
+        # all: an agent could walk a limit outward one legal step at a time.
+        accepted, rejected = config.vet_changes(self._baseline(), changes)
+        verdict.applied.update(accepted)
+        verdict.rejected.update(rejected)
 
-            # The ratchet: a risk limit may only move in the safer direction.
-            if bound.risk_limit and float(value) != float(current):
-                loosening = (
-                    (bound.safer == "lower" and float(value) > float(current))
-                    or (bound.safer == "higher" and float(value) < float(current))
-                )
-                if loosening:
-                    verdict.rejected[name] = (
-                        f"risk limits ratchet one way: {name} may only move "
-                        f"{bound.safer} (currently {current})"
-                    )
-                    continue
-
-            if apply:
+        if apply and accepted:
+            for name, value in accepted.items():
                 setattr(settings, name, value)
-            verdict.applied[name] = value
+            # Persist to the JSON contract so the change survives a restart and
+            # shows up as a reviewable diff rather than as in-memory drift.
+            merged = dict(config.STRATEGY_CONFIG.parameters())
+            merged.update(accepted)
+            try:
+                config.STRATEGY_CONFIG.write(
+                    merged, rationale=rationale, evidence=evidence, actor="hermes"
+                )
+                self.bot.mark_config_current()
+            except OSError as exc:
+                verdict.warnings.append(f"applied in memory but not persisted: {exc}")
 
         if not evidence.get("out_of_sample_validated") and verdict.applied:
             verdict.warnings.append(
@@ -462,6 +431,26 @@ class HermesControl:
         return self.audit.tail(limit)
 
     # ---------------------------------------------------------------- private
+    def _baseline(self) -> Dict[str, Any]:
+        """What a proposal is measured against: the values in force right now.
+
+        There are two anchors in this system and they are different on purpose.
+
+        * Here, the anchor is the **current effective value**, so tightening is
+          monotone — once the agent narrows a risk limit it cannot widen it
+          again by proposal. And because an accepted proposal is written to
+          ``strategy_config.json``, the tightened value is what the next process
+          starts from, so the ratchet survives a restart.
+        * In :meth:`config.Settings.apply_overlay`, the anchor is the operator's
+          own pre-overlay value, so a file that has been hand-edited, corrupted
+          or replaced wholesale can still never resolve to something looser than
+          what the operator configured.
+
+        The invariant both enforce: **no risk limit ever ends up looser than the
+        human set it.** Widening one back is a human act — edit the file.
+        """
+        return self.bot.settings.mutable_values()
+
     def _record(self, kind: str, verdict: Verdict, rationale: str, changes: dict, evidence: dict) -> None:
         self.audit.record(
             HermesAction(

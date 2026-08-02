@@ -780,6 +780,82 @@ def monthly_pnl(closed_trades: Iterable[dict], currency: str = "zar") -> Dict[st
     return dict(sorted(buckets.items()))
 
 
+def daily_pnl(closed_trades: Iterable[dict], currency: str = "usd") -> Dict[str, float]:
+    """Realised P&L bucketed by ``YYYY-MM-DD`` of the close date."""
+    key = "pnl_zar" if currency.lower() == "zar" else "pnl_usd"
+    buckets: Dict[str, float] = {}
+    for row in closed_trades:
+        closed_at = str(row.get("closed_at") or "")
+        if len(closed_at) < 10:
+            continue
+        try:
+            buckets[closed_at[:10]] = buckets.get(closed_at[:10], 0.0) + float(row.get(key) or 0.0)
+        except (TypeError, ValueError):
+            continue
+    return dict(sorted(buckets.items()))
+
+
+def performance_metrics(closed_trades: Iterable[dict], currency: str = "usd") -> Dict[str, object]:
+    """Risk-adjusted performance of the realised record.
+
+    Sharpe and Sortino are computed on the series of *daily* realised P&L, not
+    per trade. Per-trade ratios flatter a strategy that trades rarely, and this
+    one deliberately trades rarely — two entries a day at most, often none.
+
+    Every ratio is returned beside ``trading_days`` and ``trades`` so a reader
+    can tell an estimate from a number. A Sharpe computed on eleven days is a
+    rumour; the caller has to be able to see that it is.
+    """
+    rows = list(closed_trades)
+    series = daily_pnl(rows, currency)
+    values = list(series.values())
+    n = len(values)
+
+    mean = (sum(values) / n) if n else 0.0
+    variance = (sum((v - mean) ** 2 for v in values) / (n - 1)) if n > 1 else 0.0
+    stdev = math.sqrt(variance)
+    downside = [v for v in values if v < 0]
+    downside_dev = (
+        math.sqrt(sum(v * v for v in downside) / len(downside)) if downside else 0.0
+    )
+
+    # Annualised on 252 trading days. The series is daily *realised* P&L, so
+    # days with no closes are genuinely zero-P&L days, not gaps.
+    sharpe = (mean / stdev * math.sqrt(252)) if stdev > 0 else None
+    sortino = (mean / downside_dev * math.sqrt(252)) if downside_dev > 0 else None
+
+    equity, peak, max_dd = 0.0, 0.0, 0.0
+    for value in values:
+        equity += value
+        peak = max(peak, equity)
+        max_dd = min(max_dd, equity - peak)
+
+    expectancy = compute_expectancy(rows)
+    return {
+        "currency": currency.lower(),
+        "trades": expectancy.trades,
+        "trading_days": n,
+        "win_rate": expectancy.p_win,
+        "breakeven_win_rate": expectancy.breakeven_p_win,
+        "edge_vs_breakeven": expectancy.edge_vs_breakeven,
+        "expectancy_per_trade": expectancy.expectancy,
+        "profit_factor": expectancy.profit_factor,
+        "total_pnl": expectancy.total_pnl,
+        "avg_win": expectancy.avg_win,
+        "avg_loss": expectancy.avg_loss,
+        "largest_win": expectancy.largest_win,
+        "largest_loss": expectancy.largest_loss,
+        "daily_mean": mean,
+        "daily_stdev": stdev,
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "max_drawdown": max_dd,
+        "reliability": (
+            "insufficient" if n < 20 else "thin" if n < 60 else "usable"
+        ),
+    }
+
+
 # ======================================================================================
 # USD → ZAR conversion
 # ======================================================================================

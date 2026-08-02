@@ -23,6 +23,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # Keep every test's state out of the real ./state directory.
 os.environ.setdefault("BVC_STATE_DIR", tempfile.mkdtemp(prefix="bvc-test-"))
+# ...and out of the real strategy_config.json, which the agent tests write to.
+# A test run that retunes the checked-in strategy is a test run that changes how
+# the account trades.
+os.environ.setdefault("BVC_STRATEGY_CONFIG", os.path.join(os.environ["BVC_STATE_DIR"], "strategy_config.json"))
 
 import engine  # noqa: E402
 from broker_client import OptionQuote, parse_occ_symbol  # noqa: E402
@@ -986,6 +990,193 @@ def test_hermes_audit_records_rejections_too() -> None:
     assert last["accepted"] is False
     assert last["rejections"]
     assert "deploy substantially more capital" in last["rationale"]
+
+
+# ======================================================================================
+# The JSON parameter contract
+# ======================================================================================
+def _config_file(parameters: dict, name: str = "overlay"):
+    """A strategy_config.json in the test state dir, plus a Settings that reads it."""
+    import config as cfgmod
+
+    path = Path(os.environ["BVC_STATE_DIR"]) / f"cfg_{name}.json"
+    store = cfgmod.StrategyConfigFile(path)
+    store.write(parameters, rationale="test", actor="test")
+    settings = cfgmod.Settings()
+    return store, settings
+
+
+def test_config_overlay_applies_a_legal_change() -> None:
+    """The happy path: a value inside its bound reaches the engine."""
+    store, settings = _config_file({"target_delta": 0.22}, "legal")
+    settings.apply_overlay(store)
+    assert approx(settings.target_delta, 0.22)
+    assert settings.overlay_applied == {"target_delta": 0.22}
+
+
+def test_config_overlay_cannot_loosen_a_risk_limit() -> None:
+    """A hand-edited or hallucinated file must not be able to widen the governor.
+
+    This is the one that matters. The file asks for 95% margin utilisation —
+    inside no sane operator's intent — and the resolved setting is the
+    operator's own value, with a reason recorded.
+    """
+    import config as cfgmod
+
+    store, settings = _config_file({"max_margin_utilization": 0.95}, "loosen")
+    operator_value = settings.max_margin_utilization
+    settings.apply_overlay(store)
+    assert settings.max_margin_utilization == operator_value
+    assert "max_margin_utilization" in settings.overlay_rejected
+    assert cfgmod.HERMES_BOUNDS["max_margin_utilization"].risk_limit
+
+
+def test_config_overlay_cannot_touch_the_broker_or_the_account() -> None:
+    """Promoting to live money is not expressible in the file's vocabulary."""
+    store, settings = _config_file(
+        {"broker": "ibkr", "paper": False, "alpaca_api_key": "stolen", "universe": ["TSLA"]},
+        "escape",
+    )
+    before = (settings.broker, settings.paper, settings.alpaca_api_key, list(settings.universe))
+    settings.apply_overlay(store)
+    assert (settings.broker, settings.paper, settings.alpaca_api_key, list(settings.universe)) == before
+    assert set(settings.overlay_rejected) == {"broker", "paper", "alpaca_api_key", "universe"}
+
+
+def test_dropping_a_parameter_from_the_file_restores_the_operator_value() -> None:
+    """Deleting a line must actually undo it, not leave the last value stuck."""
+    store, settings = _config_file({"target_delta": 0.18}, "revert")
+    operator_delta = settings.target_delta
+    settings.apply_overlay(store)
+    assert approx(settings.target_delta, 0.18)
+
+    store.write({}, rationale="reverted", actor="test")
+    settings.apply_overlay(store)
+    assert approx(settings.target_delta, operator_delta)
+    assert settings.overlay_applied == {}
+
+
+def test_repeated_reloads_cannot_walk_a_limit_outward() -> None:
+    """The ratchet is anchored, not relative — a hundred reloads buy nothing."""
+    import config as cfgmod
+
+    store, settings = _config_file({"max_open_positions": 3}, "walk")
+    settings.apply_overlay(store)
+    assert settings.max_open_positions == 3
+
+    for target in (4, 5, 6):
+        store.write({"max_open_positions": target}, rationale="creep", actor="test")
+        settings.apply_overlay(store)
+        assert settings.max_open_positions <= cfgmod.Settings().max_open_positions
+
+
+def test_malformed_config_is_ignored_not_fatal() -> None:
+    """A corrupt file must cost the overlay, never the trading loop."""
+    import config as cfgmod
+
+    path = Path(os.environ["BVC_STATE_DIR"]) / "cfg_broken.json"
+    path.write_text("{ this is not json")
+    settings = cfgmod.Settings()
+    before = settings.target_delta
+    settings.apply_overlay(cfgmod.StrategyConfigFile(path))
+    assert approx(settings.target_delta, before)
+
+
+# ======================================================================================
+# The kill switch
+# ======================================================================================
+def test_kill_switch_is_unreachable_from_the_agent() -> None:
+    """Structural, not procedural: there is no name for it in the mutable set."""
+    import bot as botmod
+    import config as cfgmod
+
+    assert "daily_loss_limit" not in cfgmod.HERMES_BOUNDS
+    assert not any("daily_loss" in name for name in cfgmod.HERMES_BOUNDS)
+    # Not a Settings field either, so it cannot arrive through the config file.
+    assert not any("daily_loss" in f for f in cfgmod.Settings.__dataclass_fields__)
+    assert botmod.DAILY_LOSS_LIMIT_PCT > 0
+
+
+def test_kill_switch_halts_on_a_daily_loss_breach() -> None:
+    """A 5% intraday drawdown against a 3% limit must stop the bot."""
+    import bot as botmod
+    from broker_client import AccountSnapshot
+
+    bot, _, _ = _hermes_pair("killswitch")
+    healthy = AccountSnapshot(equity=100_000.0, last_equity=100_000.0)
+    assert bot._daily_loss_breach(healthy) is None
+
+    bleeding = AccountSnapshot(equity=95_000.0, last_equity=100_000.0)
+    reason = bot._daily_loss_breach(bleeding)
+    assert reason and "daily loss limit" in reason
+    assert f"{botmod.DAILY_LOSS_LIMIT_PCT:.2%}" in reason
+
+
+def test_kill_switch_runs_before_any_entry_check() -> None:
+    """It must halt the cycle, not merely block entries."""
+    from broker_client import AccountSnapshot
+    from bot import CycleResult
+
+    bot, _, _ = _hermes_pair("killorder")
+    bot.client.get_account = lambda: AccountSnapshot(  # type: ignore[method-assign]
+        equity=90_000.0, last_equity=100_000.0
+    )
+    result = CycleResult()
+    assert bot._preflight(result) is None
+    assert result.halted and bot.state.is_halted
+
+
+def test_halt_request_file_is_consumed_once() -> None:
+    """An honoured stop request must not re-halt the bot after a human resumes."""
+    import config as cfgmod
+
+    bot, _, _ = _hermes_pair("haltfile")
+    cfgmod.HALT_REQUEST_PATH.write_text('{"reason": "drawdown", "actor": "hermes-api"}')
+    reason = bot._consume_halt_request()
+    assert reason and "drawdown" in reason and "hermes-api" in reason
+    assert not cfgmod.HALT_REQUEST_PATH.exists()
+    assert bot._consume_halt_request() is None
+
+
+# ======================================================================================
+# Strict separation of the research and execution layers
+# ======================================================================================
+def test_the_research_layer_has_no_import_path_to_an_order() -> None:
+    """The HTTP surface must not be able to reach a broker, transitively.
+
+    Asserted on the import graph rather than on intent, because "we were careful"
+    is not a security property. If someone adds ``import bot`` to ``api.py`` to
+    borrow one constant, this fails.
+    """
+    import ast
+
+    root = Path(__file__).resolve().parents[1]
+    forbidden = {"bot", "broker_client", "ibkr_client", "ib_async", "ib_insync", "alpaca"}
+
+    for module in ("api.py", "memory.py"):
+        tree = ast.parse((root / module).read_text())
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+        leaked = imported & forbidden
+        assert not leaked, f"{module} imports the execution layer: {sorted(leaked)}"
+
+
+def test_performance_metrics_report_their_own_reliability() -> None:
+    """A Sharpe ratio without a sample size is a rumour — say the sample size."""
+    trades = [
+        {"closed_at": f"2026-0{m}-1{d}T16:00:00", "pnl_usd": pnl, "status": "closed"}
+        for m, d, pnl in [(1, 2, 120.0), (1, 5, -260.0), (2, 3, 95.0), (2, 8, 140.0)]
+    ]
+    metrics = engine.performance_metrics(trades, "usd")
+    assert metrics["trades"] == 4
+    assert metrics["trading_days"] == 4
+    assert metrics["reliability"] == "insufficient"
+    assert approx(metrics["total_pnl"], 95.0)
+    assert metrics["max_drawdown"] < 0  # the -260 leg must show as a drawdown
 
 
 # ======================================================================================
