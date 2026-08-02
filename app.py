@@ -1278,6 +1278,7 @@ def render_backtest(bot: TradingBot) -> None:
                     result.warnings.insert(0, f"No history for {', '.join(missing)} — excluded from the run.")
             st.session_state["bt_result"] = result
             st.session_state["bt_null"] = null
+            st.session_state["bt_prices"] = prices
         except Exception as exc:
             st.error(md_escape(f"BACKTEST FAILED — {exc}"))
             st.caption(
@@ -1296,6 +1297,11 @@ def render_backtest(bot: TradingBot) -> None:
         render_strategy_comparison(comparison, bot)
         st.divider()
     render_backtest_results(result, st.session_state.get("bt_null"), bot)
+
+    prices = st.session_state.get("bt_prices")
+    if prices:
+        st.divider()
+        render_robustness(result, prices, bot)
 
 
 def render_strategy_comparison(comparison: dict, bot: TradingBot) -> None:
@@ -1382,6 +1388,150 @@ def render_strategy_comparison(comparison: dict, bot: TradingBot) -> None:
         "Same prices, same starting capital, same rules — only the structure differs. Return on capital "
         "is the honest comparison here: a cash-secured put posts the full strike as collateral, so it can "
         "look safe and still be the worst use of the money."
+    )
+
+
+SENSITIVITY_SWEEPS = {
+    "short_delta": [0.16, 0.20, 0.25, 0.30, 0.35, 0.40],
+    "profit_target": [0.25, 0.35, 0.50, 0.65, 0.75],
+    "stop_loss": [1.0, 1.5, 2.0, 3.0, 4.0],
+    "vol_rank_threshold": [0.0, 20.0, 40.0, 50.0, 60.0, 80.0],
+    "dte_entry": [30, 38, 45, 52, 60],
+    "vrp_points": [0.0, 0.01, 0.02, 0.03, 0.05, 0.07],
+}
+
+
+def render_robustness(result, prices, bot: TradingBot) -> None:
+    """Overfitting diagnostics: sample size, out-of-sample, walk-forward, sweeps."""
+    import backtest as bt
+
+    palette = theme()
+    cfg = result.config
+
+    st.markdown('<div class="bvc-panel-title"><span class="idx">R</span>Robustness · is this an edge or a fit?</div>',
+                unsafe_allow_html=True)
+
+    sweep_param = st.selectbox("Sweep parameter", list(SENSITIVITY_SWEEPS), index=0)
+    if not st.button("◈ RUN ROBUSTNESS CHECKS", use_container_width=False):
+        st.caption(
+            "Runs about a dozen extra replays: a chronological in/out-of-sample split, four "
+            "walk-forward folds, and a sweep of the chosen parameter."
+        )
+        return
+
+    with st.spinner("Splitting, walking forward and sweeping…"):
+        adequacy = bt.sample_adequacy(result)
+        split = bt.split_sample(cfg, prices)
+        folds = bt.walk_forward(cfg, prices, folds=4)
+        sweep = bt.sensitivity(cfg, prices, sweep_param, SENSITIVITY_SWEEPS[sweep_param])
+        verdict = bt.plateau_score(sweep, getattr(cfg, sweep_param))
+
+    # ---- sample adequacy --------------------------------------------------
+    verdict_class = {"adequate": "t-good", "thin": "t-warn",
+                     "insufficient": "t-crit", "no trades": "t-crit"}[adequacy["verdict"]]
+    cells = [
+        ("TRADES", f'{adequacy["trades"]}'),
+        ("CONCURRENCY", f'{adequacy.get("concurrency", 0):.2f}×'),
+        ("EFFECTIVE N", f'{adequacy.get("effective_trades", 0):.0f}'),
+        ("FREE PARAMS", f'{adequacy["parameters"]}'),
+        ("N / PARAM", f'<span class="{verdict_class}">{adequacy["trades_per_parameter"]:.1f}</span>'),
+        ("EVIDENCE", f'<span class="{verdict_class}">{adequacy["verdict"].upper()}</span>'),
+    ]
+    html = "".join(f'<div class="bvc-cell"><div class="k">{k}</div><div class="v">{v}</div></div>' for k, v in cells)
+    st.markdown(f'<div class="bvc-strip">{html}</div>', unsafe_allow_html=True)
+    st.caption(
+        "Overlapping positions are not independent observations, so the effective count divides the "
+        "trade count by average concurrency. Below ~10 trades per free parameter, the result cannot "
+        "distinguish an edge from noise no matter how good it looks."
+    )
+
+    # ---- in / out of sample ----------------------------------------------
+    left, right = st.columns(2)
+    with left:
+        st.markdown('<div class="bvc-panel-title">In-sample vs out-of-sample</div>', unsafe_allow_html=True)
+        grid = "grid-template-columns:7rem 5rem 5rem 5rem 4rem;"
+        rows = (
+            f'<div class="bvc-row bvc-head" style="{grid}"><span>SLICE</span>'
+            "<span style='text-align:right'>CAGR</span><span style='text-align:right'>SHARPE</span>"
+            "<span style='text-align:right'>MAX DD</span><span style='text-align:right'>N</span></div>"
+        )
+        for label, key in (("in-sample", "in_sample"), ("out-of-sample", "out_of_sample")):
+            d = split[key]
+            rows += (
+                f'<div class="bvc-row" style="{grid}"><span class="t-accent">{label}</span>'
+                f'<span style="text-align:right">{d["cagr"] * 100:.1f}%</span>'
+                f'<span style="text-align:right">{d["sharpe"]:.2f}</span>'
+                f'<span class="t-crit" style="text-align:right">{d["max_drawdown"] * 100:.1f}%</span>'
+                f'<span style="text-align:right">{d["trades"]}</span></div>'
+            )
+        st.markdown(f'<div class="bvc-panel">{rows}</div>', unsafe_allow_html=True)
+        decay = split["cagr_decay"]
+        if decay is None:
+            st.caption("One of the slices took no trades — the split is inconclusive.")
+        elif decay < -0.05:
+            st.markdown(
+                f'<span class="t-crit bvc-mono">CAGR fell {abs(decay) * 100:.1f} points out of sample — '
+                "the classic overfitting signature.</span>", unsafe_allow_html=True)
+        else:
+            st.markdown(
+                f'<span class="t-good bvc-mono">CAGR held up out of sample ({decay * 100:+.1f} pts).</span>',
+                unsafe_allow_html=True)
+
+    with right:
+        st.markdown('<div class="bvc-panel-title">Walk-forward folds</div>', unsafe_allow_html=True)
+        grid = "grid-template-columns:3rem 9rem 5rem 5rem 4rem;"
+        rows = (
+            f'<div class="bvc-row bvc-head" style="{grid}"><span>#</span><span>PERIOD</span>'
+            "<span style='text-align:right'>RETURN</span><span style='text-align:right'>SHARPE</span>"
+            "<span style='text-align:right'>N</span></div>"
+        )
+        for f in folds:
+            cls = "t-good" if f["total_return"] >= 0 else "t-crit"
+            rows += (
+                f'<div class="bvc-row" style="{grid}"><span class="t-idle">{f["fold"]}</span>'
+                f'<span>{f["start"]} → {f["end"]}</span>'
+                f'<span class="{cls}" style="text-align:right">{f["total_return"] * 100:+.1f}%</span>'
+                f'<span style="text-align:right">{f["sharpe"]:.2f}</span>'
+                f'<span style="text-align:right">{f["trades"]}</span></div>'
+            )
+        st.markdown(f'<div class="bvc-panel">{rows}</div>', unsafe_allow_html=True)
+        losers = sum(1 for f in folds if f["total_return"] < 0)
+        st.caption(
+            f"{len(folds) - losers} of {len(folds)} folds profitable. One good regime can carry a "
+            "multi-year total — an edge should recur across folds, not live in one of them."
+        )
+
+    # ---- sensitivity sweep -------------------------------------------------
+    st.markdown(f'<div class="bvc-panel-title">Sensitivity · {sweep_param}</div>', unsafe_allow_html=True)
+    chosen = getattr(cfg, sweep_param)
+    xs = [r["value"] for r in sweep]
+    ys = [r["total_return"] * 100 for r in sweep]
+    fig = go.Figure(
+        go.Scatter(
+            x=xs, y=ys, mode="lines+markers",
+            line=dict(color=palette["series_1"], width=2),
+            marker=dict(size=9, color=[palette["chrome"] if abs(x - chosen) < 1e-9 else palette["series_1"] for x in xs],
+                        line=dict(width=2, color=palette["surface"])),
+            hovertemplate=f"{sweep_param}=%{{x}}<br>%{{y:.1f}}%<extra></extra>",
+        )
+    )
+    fig.add_hline(y=0, line=dict(color=palette["muted"], width=1, dash="dot"))
+    fig.update_yaxes(title_text="total return %", title_font=dict(size=11, color=palette["muted"]))
+    st.plotly_chart(style_figure(fig, height=300), use_container_width=True, config={"displayModeBar": False})
+
+    tone = ("t-crit" if "SPIKE" in verdict["verdict"] else
+            "t-warn" if "fragile" in verdict["verdict"] else "t-good")
+    st.markdown(
+        f'<span class="{tone} bvc-mono">{verdict["verdict"].upper()}</span>'
+        f'<span class="t-idle bvc-mono"> · your setting ({chosen}) is highlighted amber · '
+        f'{verdict.get("share_positive", 0) * 100:.0f}% of the sweep is profitable</span>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "A real edge sits on a plateau: nudging the parameter moves the result a little. A curve fit "
+        "sits on a spike — the chosen value is a peak surrounded by much worse neighbours, which means "
+        "it was picked to fit noise. If a filter's sweep is flat or downward-sloping, that filter is "
+        "not earning its place."
     )
 
 

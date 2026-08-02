@@ -639,6 +639,189 @@ def run_backtest(cfg: BacktestConfig, broker=None) -> BacktestResult:
     return result
 
 
+
+# ======================================================================================
+# Robustness — the checks that separate an edge from a curve fit
+# ======================================================================================
+#: Every knob that could be tuned against the data. Counted, not hidden: the
+#: ratio of trades to free parameters is the first thing an overfit strategy
+#: fails, and it is arithmetic rather than opinion.
+TUNABLE_PARAMETERS = (
+    "short_delta", "long_delta", "dte_entry", "dte_exit", "profit_target",
+    "stop_loss", "vol_rank_threshold", "vrp_points", "max_allocation_per_asset",
+    "trade_allocation_pct",
+)
+
+
+def sample_adequacy(result: BacktestResult) -> dict:
+    """How much independent evidence is actually behind the result.
+
+    Trade count alone flatters a strategy that holds overlapping positions: two
+    short puts open in the same week through the same selloff are close to one
+    observation, not two. The effective count here divides by the average number
+    of positions held concurrently, which is crude but directionally honest.
+    """
+    trades = result.trades
+    if not trades:
+        return {"trades": 0, "parameters": len(TUNABLE_PARAMETERS), "trades_per_parameter": 0.0,
+                "effective_trades": 0.0, "verdict": "no trades"}
+
+    import pandas as pd
+
+    spans = [(pd.Timestamp(t["opened_at"]), pd.Timestamp(t["closed_at"])) for t in trades]
+    total_days = sum(max((c - o).days, 1) for o, c in spans)
+    span_days = max((max(c for _, c in spans) - min(o for o, _ in spans)).days, 1)
+    concurrency = max(total_days / span_days, 1.0)
+    effective = len(trades) / concurrency
+
+    per_param = effective / len(TUNABLE_PARAMETERS)
+    if per_param >= 20:
+        verdict = "adequate"
+    elif per_param >= 10:
+        verdict = "thin"
+    else:
+        verdict = "insufficient"
+    return {
+        "trades": len(trades),
+        "parameters": len(TUNABLE_PARAMETERS),
+        "concurrency": concurrency,
+        "effective_trades": effective,
+        "trades_per_parameter": per_param,
+        "verdict": verdict,
+    }
+
+
+def split_sample(
+    cfg: BacktestConfig,
+    prices: Dict[str, "pd.DataFrame"],
+    train_fraction: float = 0.6,
+) -> dict:
+    """Run the first slice of history, then the rest, and compare.
+
+    A strategy tuned to its history looks strong on the slice it was tuned on
+    and falls apart afterwards. Splitting chronologically — never randomly, which
+    would leak the future into the past — is the cheapest way to see that.
+    """
+    import pandas as pd
+
+    start, end = pd.to_datetime(cfg.start_date), pd.to_datetime(cfg.end_date)
+    cut = start + (end - start) * train_fraction
+    cut_str = cut.strftime("%Y-%m-%d")
+
+    from dataclasses import replace as _replace
+
+    in_sample = Backtester(_replace(cfg, end_date=cut_str), prices).run()
+    out_sample = Backtester(_replace(cfg, start_date=cut_str), prices).run()
+
+    def summarise(result):
+        m = result.metrics
+        return {
+            "start": m.get("start"), "end": m.get("end"),
+            "cagr": m.get("cagr", 0.0), "sharpe": m.get("sharpe", 0.0),
+            "max_drawdown": m.get("max_drawdown", 0.0), "trades": m.get("trades", 0),
+            "win_rate": m.get("win_rate", 0.0), "expectancy": m.get("expectancy", 0.0),
+        }
+
+    a, b = summarise(in_sample), summarise(out_sample)
+    decay = (b["cagr"] - a["cagr"]) if a["trades"] and b["trades"] else None
+    return {"in_sample": a, "out_of_sample": b, "cagr_decay": decay, "cut": cut_str}
+
+
+def walk_forward(
+    cfg: BacktestConfig,
+    prices: Dict[str, "pd.DataFrame"],
+    folds: int = 4,
+) -> List[dict]:
+    """Sequential, non-overlapping slices of history, each scored on its own.
+
+    One good year can carry a six-year total. Per-fold results show whether the
+    edge recurs or whether it was one regime.
+    """
+    import pandas as pd
+
+    from dataclasses import replace as _replace
+
+    start, end = pd.to_datetime(cfg.start_date), pd.to_datetime(cfg.end_date)
+    edges = [start + (end - start) * (i / folds) for i in range(folds + 1)]
+    out = []
+    for i in range(folds):
+        fold_cfg = _replace(
+            cfg,
+            start_date=edges[i].strftime("%Y-%m-%d"),
+            end_date=edges[i + 1].strftime("%Y-%m-%d"),
+        )
+        m = Backtester(fold_cfg, prices).run().metrics
+        out.append({
+            "fold": i + 1,
+            "start": m.get("start"), "end": m.get("end"),
+            "cagr": m.get("cagr", 0.0), "total_return": m.get("total_return", 0.0),
+            "sharpe": m.get("sharpe", 0.0), "max_drawdown": m.get("max_drawdown", 0.0),
+            "trades": m.get("trades", 0),
+        })
+    return out
+
+
+def sensitivity(
+    cfg: BacktestConfig,
+    prices: Dict[str, "pd.DataFrame"],
+    parameter: str,
+    values: Sequence[float],
+) -> List[dict]:
+    """Sweep one parameter and report the curve.
+
+    This is the most informative overfitting test available here. A real edge
+    sits on a **plateau** — nudging the parameter moves the result a little. A
+    curve fit sits on a **spike**: the chosen value is a peak surrounded by much
+    worse neighbours, which means it was selected to fit noise.
+    """
+    from dataclasses import replace as _replace
+
+    rows = []
+    for value in values:
+        result = Backtester(_replace(cfg, **{parameter: value}), prices).run()
+        m = result.metrics
+        rows.append({
+            "value": value,
+            "total_return": m.get("total_return", 0.0),
+            "cagr": m.get("cagr", 0.0),
+            "sharpe": m.get("sharpe", 0.0),
+            "max_drawdown": m.get("max_drawdown", 0.0),
+            "trades": m.get("trades", 0),
+        })
+    return rows
+
+
+def plateau_score(rows: List[dict], chosen: float, metric: str = "total_return") -> dict:
+    """Is the chosen value a plateau or a spike?
+
+    Compares the chosen setting against the median of the whole sweep. A value
+    far above its own neighbourhood is the signature of a fit; a value close to
+    the median of a broadly positive sweep is the signature of an edge that does
+    not depend on the exact number.
+    """
+    scored = [r for r in rows if r["trades"] > 0]
+    if len(scored) < 3:
+        return {"verdict": "insufficient sweep", "chosen": None, "median": None, "ratio": None}
+
+    values = sorted(r[metric] for r in scored)
+    median = values[len(values) // 2]
+    here = min(scored, key=lambda r: abs(r["value"] - chosen))[metric]
+    positive = sum(1 for v in values if v > 0) / len(values)
+
+    # Graded on the gap and the share of the sweep that works, never on a
+    # ratio: when the median is negative or near zero, here/median flips sign
+    # or explodes, and a genuine spike gets graded as merely fragile.
+    gap = here - median
+    if positive >= 0.7:
+        verdict = "plateau — result survives the neighbourhood"
+    elif gap > 0 and positive <= 0.4:
+        verdict = "SPIKE — the chosen value looks fitted"
+    else:
+        verdict = "fragile — much of the sweep loses money"
+    return {"verdict": verdict, "chosen": here, "median": median, "gap": gap,
+            "share_positive": positive}
+
+
 ALL_STRATEGIES = ("short_put", "put_credit_spread", "iron_condor")
 
 

@@ -635,6 +635,96 @@ def test_entry_window_blocks_the_live_bot_outside_its_hours() -> None:
 
 
 # ======================================================================================
+# Overfitting diagnostics
+# ======================================================================================
+def test_sample_adequacy_discounts_overlapping_trades() -> None:
+    """Concurrent positions are not independent observations."""
+    import backtest as bt
+
+    prices = {"SPY": _synthetic_frame(seed=21), "QQQ": _synthetic_frame(seed=22, s0=200.0)}
+    cfg = bt.BacktestConfig(
+        symbols=["SPY", "QQQ"], start_date="2020-01-01", end_date="2022-01-01",
+        strategy="put_credit_spread", vrp_points=0.03,
+    )
+    result = bt.Backtester(cfg, prices).run()
+    adequacy = bt.sample_adequacy(result)
+
+    assert adequacy["trades"] > 0
+    assert adequacy["concurrency"] >= 1.0
+    # Effective sample can never exceed the raw count, and must shrink when
+    # positions overlap in time.
+    assert adequacy["effective_trades"] <= adequacy["trades"] + 1e-9
+    assert adequacy["parameters"] == len(bt.TUNABLE_PARAMETERS)
+    assert adequacy["verdict"] in {"adequate", "thin", "insufficient"}
+
+
+def test_split_sample_is_chronological_not_random() -> None:
+    """A random split would leak the future into the training slice."""
+    import backtest as bt
+
+    prices = {"SPY": _synthetic_frame(seed=23)}
+    cfg = bt.BacktestConfig(
+        symbols=["SPY"], start_date="2020-01-01", end_date="2023-01-01",
+        strategy="put_credit_spread", vrp_points=0.03,
+    )
+    split = bt.split_sample(cfg, prices, train_fraction=0.6)
+    assert split["in_sample"]["end"] <= split["out_of_sample"]["start"]
+    assert split["in_sample"]["start"] < split["out_of_sample"]["start"]
+
+
+def test_walk_forward_covers_history_without_overlap() -> None:
+    import backtest as bt
+
+    prices = {"SPY": _synthetic_frame(seed=24)}
+    cfg = bt.BacktestConfig(
+        symbols=["SPY"], start_date="2020-01-01", end_date="2023-01-01",
+        strategy="put_credit_spread", vrp_points=0.03,
+    )
+    folds = bt.walk_forward(cfg, prices, folds=3)
+    assert len(folds) == 3
+    for earlier, later in zip(folds, folds[1:]):
+        assert earlier["end"] <= later["start"]
+
+
+def test_sensitivity_sweep_and_plateau_verdict() -> None:
+    """The sweep must vary the parameter and grade the chosen value."""
+    import backtest as bt
+
+    prices = {"SPY": _synthetic_frame(seed=25)}
+    cfg = bt.BacktestConfig(
+        symbols=["SPY"], start_date="2020-01-01", end_date="2023-01-01",
+        strategy="put_credit_spread", vrp_points=0.03, short_delta=0.30,
+    )
+    rows = bt.sensitivity(cfg, prices, "short_delta", [0.20, 0.25, 0.30, 0.35])
+    assert [r["value"] for r in rows] == [0.20, 0.25, 0.30, 0.35]
+    assert len({r["total_return"] for r in rows}) > 1  # the knob actually moves the result
+
+    verdict = bt.plateau_score(rows, 0.30)
+    assert verdict["verdict"] != "insufficient sweep"
+    assert 0.0 <= verdict["share_positive"] <= 1.0
+
+
+def test_plateau_score_flags_a_manufactured_spike() -> None:
+    """A peak surrounded by losses must be called a spike, not a plateau."""
+    import backtest as bt
+
+    spike = [
+        {"value": 0.1, "total_return": -0.20, "trades": 40},
+        {"value": 0.2, "total_return": -0.15, "trades": 40},
+        {"value": 0.3, "total_return": 0.90, "trades": 40},   # the fitted peak
+        {"value": 0.4, "total_return": -0.18, "trades": 40},
+        {"value": 0.5, "total_return": -0.25, "trades": 40},
+    ]
+    assert "SPIKE" in bt.plateau_score(spike, 0.3)["verdict"]
+
+    plateau = [
+        {"value": v, "total_return": r, "trades": 40}
+        for v, r in ((0.1, 0.30), (0.2, 0.34), (0.3, 0.36), (0.4, 0.31), (0.5, 0.28))
+    ]
+    assert "plateau" in bt.plateau_score(plateau, 0.3)["verdict"]
+
+
+# ======================================================================================
 # Runner
 # ======================================================================================
 def main() -> int:

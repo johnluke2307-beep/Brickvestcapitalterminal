@@ -153,6 +153,36 @@ downloads are cached for an hour and shared with the null run, which halves the
 requests. If Yahoo rate-limits the host (shared cloud IP ranges do get 429s), the
 loader falls back to the broker feed when the Alpaca client is connected.
 
+### Is it an edge or a curve fit?
+
+The **Robustness** panel (and `sample_adequacy` / `split_sample` / `walk_forward` /
+`sensitivity` / `plateau_score` in `backtest.py`) runs the checks that separate
+the two:
+
+- **Sample adequacy.** Trades, free parameters, and the ratio between them.
+  Overlapping positions are not independent observations, so the effective count
+  divides the trade count by average concurrency. Below ~10 effective trades per
+  free parameter the result cannot distinguish edge from noise however good it
+  looks.
+- **In-sample vs out-of-sample.** A chronological 60/40 split — never random,
+  which would leak the future into the training slice. A large CAGR drop on the
+  unseen slice is the classic overfitting signature.
+- **Walk-forward folds.** Four sequential, non-overlapping slices. One good
+  regime can carry a multi-year total; an edge should recur.
+- **Parameter sensitivity.** The most informative test available here. A real
+  edge sits on a **plateau** — nudging delta from 0.30 to 0.28 moves the result a
+  little. A curve fit sits on a **spike**: the chosen value is a peak surrounded
+  by much worse neighbours, meaning it was picked to fit noise. A flat or
+  downward-sloping sweep says the filter is not earning its place.
+
+Two things worth stating plainly. First, the shipped defaults — 45 DTE, 30 delta,
+50% profit, 200% stop, 21-DTE exit — were **not** fitted to this data; they are
+long-standing conventions chosen before any backtest was run, which is the
+strongest anti-overfitting property the platform has. Second, that property is
+destroyed the moment the sliders are used to hunt for the best combination. Every
+configuration tried is a silent multiple-comparison, and the tab does not know how
+many you have tried. Decide the rules first, then test them.
+
 What it does **not** model: bid/ask spread, early assignment, dividend and pin
 risk, volatility skew across strikes, or whether a strike was actually listed and
 liquid. Real fills are worse than these. Treat the output as a sanity check on the
