@@ -1,0 +1,23 @@
+# Brickvestcapitalterminal — production dependencies.
+#
+# Deliberately small: this must install inside the free tiers of Streamlit
+# Community Cloud and Hugging Face Spaces. No SciPy, no NumPy-heavy stack —
+# the Black-Scholes maths in engine.py is pure standard library.
+
+streamlit>=1.37,<2.0        # dashboard runtime (st.fragment / column_config)
+alpaca-py>=0.42,<1.0        # trading, options chains and market data
+pandas>=2.0                 # tabular views only
+plotly>=5.20,<7.0           # charts
+rich>=13.0,<15.0            # console deck (terminal.py)
+yfinance>=0.2.40            # historical prices for the backtester
+
+# Research-layer API (optional — only needed to run api.py). The dashboard and
+# the trading loop do not import these.
+fastapi>=0.110,<1.0        # telemetry + bounded parameter control for Hermes
+uvicorn>=0.27,<1.0         # ASGI server for api.py
+# honcho-ai>=2.0           # optional durable memory for the optimizer; memory.py
+#                          # falls back to a local JSONL when it is absent.
+
+# Interactive Brokers (optional — only needed when BVC_BROKER=ibkr).
+# ib_async is the maintained successor to ib_insync, which was archived in 2024.
+ib_async>=2.0,<3.0          # IBKR connector: resting brackets + historical IV

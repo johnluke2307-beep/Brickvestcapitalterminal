@@ -1,0 +1,19 @@
+# Brickvestcapitalterminal — terminal chrome.
+#
+# Dark deck with monospace figures, so the web dashboard reads like the console
+# terminal in terminal.py. Colours are the dark steps of the same
+# colourblind-validated palette the charts use, checked against this background.
+
+[theme]
+base = "dark"
+primaryColor = "#ffa028"          # amber — the terminal's chrome voice
+backgroundColor = "#05070a"       # deck background (near-black)
+secondaryBackgroundColor = "#0a0d12"  # panels, sidebar, table headers
+textColor = "#e8edf2"
+font = "monospace"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

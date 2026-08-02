@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "strategy": "call_credit_spread",
+  "label": "Call credit spread",
+  "thesis": "The same structure on the upside. Useful when IV is rich but the skew makes puts the expensive side to be short.",
+  "updated_at": "",
+  "updated_by": "operator",
+  "rationale": "Starting parameters for Call credit spread. Not a fitted result.",
+  "evidence": {
+    "out_of_sample_validated": false
+  },
+  "parameters": {
+    "target_delta": 0.3,
+    "delta_tolerance": 0.08,
+    "target_dte": 45,
+    "min_iv_rank": 50.0,
+    "min_vrp": 0.02,
+    "profit_target_pct": 0.5,
+    "stop_loss_multiple": 1.0,
+    "time_exit_dte": 21,
+    "min_credit_usd": 0.35,
+    "max_spread_pct": 0.2,
+    "wing_delta": 0.1,
+    "max_spread_width": 0.0,
+    "long_leg_delta": 0.8,
+    "back_month_dte": 105,
+    "max_margin_utilization": 0.5,
+    "max_open_positions": 6,
+    "max_new_positions_per_day": 2,
+    "contracts_per_trade": 1,
+    "min_equity_usd": 2000.0
+  }
+}
